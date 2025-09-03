@@ -1,4 +1,4 @@
-// index.js (LINE version)
+// index.js (LINE version) — with UNIT support
 import express from "express";
 import * as line from "@line/bot-sdk";            // <— no default export; use namespace import
 import { readFile } from "fs/promises";
@@ -42,6 +42,8 @@ let NAME_INDEX = new Map();
 
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
+
+  // Simple CSV parser (handles quotes)
   const rows = [];
   let i = 0, field = "", row = [], inQuotes = false;
   while (i < csv.length) {
@@ -64,21 +66,30 @@ async function loadProducts() {
   const header = rows[0].map(h => h.trim().toLowerCase());
   const nameIdx = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
   const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
+  // NEW: unit column (supports common variations)
+  const unitIdx = header.findIndex(h => ["unit","units","uom","หน่วย","per","per_unit","perunit"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-    const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
-    const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
+
+    const rawName = (cols[(nameIdx !== -1 ? nameIdx : 0)] || "").trim();
+    const rawPrice = (cols[(priceIdx !== -1 ? priceIdx : 1)] || "").trim();
+    const rawUnit  = unitIdx !== -1 ? (cols[unitIdx] || "").trim() : "";
+
     if (!rawName) continue;
+
     const price = Number(String(rawPrice).replace(/[^\d.]/g, ""));
+    const unit  = rawUnit;
+
     const n = norm(rawName);
     const kw = tokens(rawName);
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    const item = { name: rawName, price, normName: n, num, keywords: kw };
+    // Store unit on item
+    const item = { name: rawName, price, unit, normName: n, num, keywords: kw };
     PRODUCTS.push(item);
     if (!NAME_INDEX.has(n)) NAME_INDEX.set(n, item);
   }
@@ -117,9 +128,12 @@ async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
-  const productList = PRODUCTS.map(
-    p => `${p.name} = ${Number.isFinite(p.price) ? p.price + " บาท" : p.price}`
-  ).join("\n");
+  // Build product catalog lines with price + unit
+  const productList = PRODUCTS.map(p => {
+    const priceText = Number.isFinite(p.price) ? `${p.price} บาท` : "ไม่มีราคา";
+    const unitText = p.unit ? ` ต่อ ${p.unit}` : "";
+    return `${p.name} = ${priceText}${unitText}`;
+  }).join("\n");
 
   try {
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -145,7 +159,8 @@ ${productList}
 INSTRUCTIONS:
 - Answer in Thai language naturally and conversationally
 - When customers ask about prices, provide the exact price from the catalog above
-- Bold the product name and price.
+- Always include the unit after the price if available (e.g., "ต่อ กก.", "ต่อ กล่อง")
+- Bold the product name and price (you may leave the unit unbolded)
 - If a product isn't found, suggest similar products or ask for clarification
 - Be helpful, polite, and use appropriate Thai politeness particles (ค่ะ, นะ, etc.)
 - Handle variations in product names, codes, and customer questions flexibly
