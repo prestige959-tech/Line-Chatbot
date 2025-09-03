@@ -257,7 +257,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
         reply = await askOpenRouter(text, history);
       } catch (e) {
         console.error("OpenRouter error:", e?.message);
-        reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง 🙏";
+        reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
       }
 
       history.push({ role: "user", content: text });
