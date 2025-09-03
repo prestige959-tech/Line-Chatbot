@@ -1,0 +1,14 @@
+{
+  "name": "my-shop-prices",
+  "version": "1.0.0",
+  "description": "Facebook Messenger bot connected to OpenRouter",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "redis": "^4.6.14"
+  }
+}
