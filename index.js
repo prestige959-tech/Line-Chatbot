@@ -1,6 +1,6 @@
 // index.js (LINE version)
 import express from "express";
-import line from "@line/bot-sdk";
+import * as line from "@line/bot-sdk";            // <— no default export; use namespace import
 import { readFile } from "fs/promises";
 import { getContext, setContext } from "./chatMemory.js";
 
@@ -18,10 +18,9 @@ console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 
 const lineConfig = {
   channelAccessToken: LINE_ACCESS_TOKEN,
-  channelSecret: LINE_CHANNEL_SECRET
+  channelSecret: LINE_CHANNEL_SECRET,
 };
-const { Client, middleware } = line;
-const lineClient = new Client(lineConfig);
+const lineClient = new line.Client(lineConfig);
 
 // ---- Small helpers ----
 function norm(s) {
@@ -44,66 +43,27 @@ let NAME_INDEX = new Map();
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
   const rows = [];
-  let i = 0,
-    field = "",
-    row = [],
-    inQuotes = false;
+  let i = 0, field = "", row = [], inQuotes = false;
   while (i < csv.length) {
     const c = csv[i];
     if (inQuotes) {
       if (c === '"') {
-        if (csv[i + 1] === '"') {
-          field += '"';
-          i += 2;
-          continue;
-        }
-        inQuotes = false;
-        i++;
-        continue;
-      } else {
-        field += c;
-        i++;
-        continue;
-      }
+        if (csv[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      } else { field += c; i++; continue; }
     } else {
-      if (c === '"') {
-        inQuotes = true;
-        i++;
-        continue;
-      }
-      if (c === ",") {
-        row.push(field);
-        field = "";
-        i++;
-        continue;
-      }
-      if (c === "\n") {
-        row.push(field);
-        rows.push(row);
-        row = [];
-        field = "";
-        i++;
-        continue;
-      }
-      if (c === "\r") {
-        i++;
-        continue;
-      }
-      field += c;
-      i++;
-      continue;
+      if (c === '"') { inQuotes = true; i++; continue; }
+      if (c === ",") { row.push(field); field = ""; i++; continue; }
+      if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; i++; continue; }
+      if (c === "\r") { i++; continue; }
+      field += c; i++; continue;
     }
   }
-  row.push(field);
-  rows.push(row);
+  row.push(field); rows.push(row);
 
   const header = rows[0].map(h => h.trim().toLowerCase());
-  const nameIdx = header.findIndex(h =>
-    ["name", "product", "title", "สินค้า", "รายการ", "product_name"].includes(h)
-  );
-  const priceIdx = header.findIndex(h =>
-    ["price", "ราคา", "amount", "cost"].includes(h)
-  );
+  const nameIdx = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
+  const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
@@ -214,10 +174,9 @@ INSTRUCTIONS:
   }
 }
 
-// ---- LINE webhook (POST only) ----
-app.post("/webhook", middleware(lineConfig), async (req, res) => {
-  // Acknowledge immediately
-  res.status(200).end();
+// ---- LINE webhook (POST only). Do NOT add express.json() before this.
+app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
+  res.status(200).end(); // ack LINE quickly
 
   const events = Array.isArray(req.body?.events) ? req.body.events : [];
   for (const ev of events) {
@@ -246,7 +205,7 @@ app.post("/webhook", middleware(lineConfig), async (req, res) => {
 
       await lineClient.replyMessage(ev.replyToken, {
         type: "text",
-        text: (reply || "").slice(0, 5000) // LINE text limit is generous; keep safe slice
+        text: (reply || "").slice(0, 5000)
       });
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
@@ -254,7 +213,7 @@ app.post("/webhook", middleware(lineConfig), async (req, res) => {
   }
 });
 
-// Optional: simple health check
+// Health check
 app.get("/", (_req, res) => res.send("LINE bot is running"));
 
 const PORT = process.env.PORT || 3000;
