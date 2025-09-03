@@ -1,4 +1,4 @@
-// index.js (LINE version) — with UNIT support
+// index.js (LINE version)
 import express from "express";
 import * as line from "@line/bot-sdk";            // <— no default export; use namespace import
 import { readFile } from "fs/promises";
@@ -42,8 +42,6 @@ let NAME_INDEX = new Map();
 
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
-
-  // Simple CSV parser (handles quotes)
   const rows = [];
   let i = 0, field = "", row = [], inQuotes = false;
   while (i < csv.length) {
@@ -66,30 +64,21 @@ async function loadProducts() {
   const header = rows[0].map(h => h.trim().toLowerCase());
   const nameIdx = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
   const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
-  // NEW: unit column (supports common variations)
-  const unitIdx = header.findIndex(h => ["unit","units","uom","หน่วย","per","per_unit","perunit"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-
-    const rawName = (cols[(nameIdx !== -1 ? nameIdx : 0)] || "").trim();
-    const rawPrice = (cols[(priceIdx !== -1 ? priceIdx : 1)] || "").trim();
-    const rawUnit  = unitIdx !== -1 ? (cols[unitIdx] || "").trim() : "";
-
+    const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
+    const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
     if (!rawName) continue;
-
     const price = Number(String(rawPrice).replace(/[^\d.]/g, ""));
-    const unit  = rawUnit;
-
     const n = norm(rawName);
     const kw = tokens(rawName);
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    // Store unit on item
-    const item = { name: rawName, price, unit, normName: n, num, keywords: kw };
+    const item = { name: rawName, price, normName: n, num, keywords: kw };
     PRODUCTS.push(item);
     if (!NAME_INDEX.has(n)) NAME_INDEX.set(n, item);
   }
@@ -128,12 +117,9 @@ async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
-  // Build product catalog lines with price + unit
-  const productList = PRODUCTS.map(p => {
-    const priceText = Number.isFinite(p.price) ? `${p.price} บาท` : "ไม่มีราคา";
-    const unitText = p.unit ? ` ต่อ ${p.unit}` : "";
-    return `${p.name} = ${priceText}${unitText}`;
-  }).join("\n");
+  const productList = PRODUCTS.map(
+    p => `${p.name} = ${Number.isFinite(p.price) ? p.price + " บาท" : p.price}`
+  ).join("\n");
 
   try {
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -153,43 +139,22 @@ async function askOpenRouter(userText, history = []) {
             role: "system",
             content: `You are a friendly Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
 
-                    PRODUCT CATALOG:
-                    ${productList}
-                    
-                    INSTRUCTIONS:
-                    - Answer in Thai language naturally and conversationally
-                    - When customers ask about prices, provide the exact price from the catalog above
-                    - Always include the unit after the price if available (e.g., "ต่อ กก.", "ต่อ กล่อง")
-                    - If a product isn't found, suggest similar products or ask for clarification
-                    - Be helpful, polite, and use appropriate Thai politeness particles (ค่ะ, ครับ, นะคะ, นะครับ)
-                    - Keep responses concise but friendly
-                    - Always add a polite closing like "ขอบคุณที่สนใจสินค้าค่ะ" where suitable
-                    
-                    ORDER & PAYMENT:
-                    - If a customer wants to order, confirm with:  
-                      “คุณลูกค้าต้องการสั่ง [product] [quantity] รวมทั้งหมด [total price] ใช่ไหมคะ?”  
-                    - Payment method: โอนก่อนเท่านั้น. Answer clearly if customers ask about payment.
-                    
-                    DELIVERY:
-                    - If customers ask about delivery such as "ส่งไหม" or "มีบริการส่งไหม", answer:  
-                      "บริษัทเรามีบริการจัดส่งโดยใช้ Lalamove ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ  
-                      ทางร้านจะเป็นผู้เรียกรถให้ ส่วน ค่าขนส่งลูกค้าชำระเองนะคะ  
-                      เรื่อง ยกสินค้าลง ทางร้านไม่มีทีมบริการให้ค่ะ ลูกค้าต้อง จัดหาคนช่วยยกลงเอง นะคะ"
-                    
-                    ADMIN ESCALATION:
-                    - If customers ask about:
-                      • Products not in the catalog (and no similar alternatives exist)  
-                      • Discounts, promotions, or warranty questions  
-                      • Special requests outside the instructions  
-                      • Asking for a phone number or saying they want to talk to staff directly  
-                    - Then reply:  
-                      "ขออภัยค่ะ เรื่องนี้ต้องให้แอดมินช่วยตรวจสอบเพิ่มเติม กรุณาโทร 088-277-0145 นะคะ"  
-                      → Do not attempt to answer further.
-                    
-                    EXTRAS:
-                    - If appropriate, you may suggest related products to upsell.  
-                    - Keep the experience warm and service-oriented, like a real shop assistant.  
-`
+PRODUCT CATALOG:
+${productList}
+
+INSTRUCTIONS:
+- Answer in Thai language naturally and conversationally
+- When customers ask about prices, provide the exact price from the catalog above
+- Bold the product name and price.
+- If a product isn't found, suggest similar products or ask for clarification
+- Be helpful, polite, and use appropriate Thai politeness particles (ค่ะ, นะ, etc.)
+- Handle variations in product names, codes, and customer questions flexibly
+- If customers ask general questions not related to products, respond helpfully as a shop assistant would
+- Keep responses concise but friendly
+- If customers ask for delivery such as "ส่งไหม" or มีบริการส่งไหม, answer 
+  "บริษัทเรามีบริการจัดส่งโดยใช้ Lalamove ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ
+  ทางร้านจะเป็นผู้เรียกรถให้ ส่วน ค่าขนส่งลูกค้าชำระเองนะคะ
+  เรื่อง ยกสินค้าลง ทางร้านไม่มีทีมบริการให้ค่ะ ลูกค้าต้อง จัดหาคนช่วยยกลงเอง นะคะ"`
           },
           ...history,
           { role: "user", content: userText }
