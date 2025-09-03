@@ -1,27 +1,29 @@
-// index.js
+// index.js (LINE version)
 import express from "express";
+import line from "@line/bot-sdk";
 import { readFile } from "fs/promises";
-import { getContext, setContext } from './chatMemory.js';
+import { getContext, setContext } from "./chatMemory.js";
 
 const app = express();
-app.use(express.json());
 
 // ---- ENV ----
-const PAGE_TOKEN = (process.env.FACEBOOK_PAGE_ACCESS_TOKEN || "").trim();
-const VERIFY_TOKEN = (process.env.FACEBOOK_VERIFY_TOKEN || "").trim();
+const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
+const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
 const MODEL = process.env.MODEL || "moonshotai/kimi-k2";
 
-// ---- Small helpers ----
-const encode = encodeURIComponent;
 const mask = s =>
-  !s
-    ? "(empty)"
-    : s.replace(/\s+/g, "").slice(0, 4) +
-      "..." +
-      s.replace(/\s+/g, "").slice(-4);
-console.log("ENV → PAGE_TOKEN:", mask(PAGE_TOKEN));
+  !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
+console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 
+const lineConfig = {
+  channelAccessToken: LINE_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET
+};
+const { Client, middleware } = line;
+const lineClient = new Client(lineConfig);
+
+// ---- Small helpers ----
 function norm(s) {
   return (s || "")
     .toLowerCase()
@@ -104,6 +106,7 @@ async function loadProducts() {
   );
 
   PRODUCTS = [];
+  NAME_INDEX = new Map();
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
     const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
@@ -128,20 +131,14 @@ function findProduct(query) {
   if (NAME_INDEX.has(qn)) return NAME_INDEX.get(qn);
 
   const num = (query.match(/#\s*(\d+)/) || [])[1];
-  const must = qTokens.filter(
-    t => t.length >= 2 && !/^#?\d+$/.test(t)
-  );
+  const must = qTokens.filter(t => t.length >= 2 && !/^#?\d+$/.test(t));
   let candidates = PRODUCTS;
 
   if (num) {
-    candidates = candidates.filter(
-      p => p.num === num || p.name.includes(`#${num}`)
-    );
+    candidates = candidates.filter(p => p.num === num || p.name.includes(`#${num}`));
   }
   if (must.length) {
-    candidates = candidates.filter(p =>
-      must.every(t => norm(p.name).includes(norm(t)))
-    );
+    candidates = candidates.filter(p => must.every(t => norm(p.name).includes(norm(t))));
   }
   if (candidates.length > 1) {
     candidates.sort((a, b) => {
@@ -153,27 +150,6 @@ function findProduct(query) {
     });
   }
   return candidates[0] || null;
-}
-
-// ---- Facebook send ----
-async function sendFBMessage(psid, text) {
-  const url = `https://graph.facebook.com/v16.0/me/messages?access_token=${encode(
-    PAGE_TOKEN
-  )}`;
-  const body = {
-    recipient: { id: psid },
-    messaging_type: "RESPONSE",
-    message: { text: text?.slice(0, 2000) || "" }
-  };
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`FB send failed ${r.status}: ${t}`);
-  }
 }
 
 // ---- OpenRouter chat with product knowledge + history ----
@@ -193,7 +169,7 @@ async function askOpenRouter(userText, history = []) {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
         "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices",
-        "X-Title": "my-shop-prices fb-bot"
+        "X-Title": "my-shop-prices line-bot"
       },
       body: JSON.stringify({
         model: MODEL,
@@ -219,7 +195,6 @@ INSTRUCTIONS:
   "บริษัทเรามีบริการจัดส่งโดยใช้ Lalamove ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ
   ทางร้านจะเป็นผู้เรียกรถให้ ส่วน ค่าขนส่งลูกค้าชำระเองนะคะ
   เรื่อง ยกสินค้าลง ทางร้านไม่มีทีมบริการให้ค่ะ ลูกค้าต้อง จัดหาคนช่วยยกลงเอง นะคะ"`
-
           },
           ...history,
           { role: "user", content: userText }
@@ -231,10 +206,7 @@ INSTRUCTIONS:
       throw new Error(`OpenRouter ${r.status}: ${text}`);
     }
     const data = await r.json();
-    const content =
-      data?.choices?.[0]?.message?.content ??
-      data?.choices?.[0]?.text ??
-      null;
+    const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? null;
     if (!content) throw new Error("No content from OpenRouter");
     return content.trim();
   } finally {
@@ -242,59 +214,49 @@ INSTRUCTIONS:
   }
 }
 
-// ---- Webhook verify ----
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN)
-    return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
+// ---- LINE webhook (POST only) ----
+app.post("/webhook", middleware(lineConfig), async (req, res) => {
+  // Acknowledge immediately
+  res.status(200).end();
 
-// ---- Webhook receiver ----
-app.post("/webhook", async (req, res) => {
-  try {
-    res.sendStatus(200); // ack fast
-    const body = req.body;
-    if (body.object !== "page" || !Array.isArray(body.entry)) return;
+  const events = Array.isArray(req.body?.events) ? req.body.events : [];
+  for (const ev of events) {
+    try {
+      if (ev.type !== "message" || ev.message?.type !== "text") continue;
 
-    for (const entry of body.entry) {
-      const msgs = entry.messaging || [];
-      for (const ev of msgs) {
-        const psid = ev?.sender?.id;
-        const text = ev?.message?.text?.trim();
-        if (!psid || !text) continue;
+      const userId = ev?.source?.userId;
+      const text = ev?.message?.text?.trim();
+      if (!userId || !text) continue;
 
-        console.log("IN:", { psid, text });
+      console.log("IN:", { userId, text });
 
-        const history = await getContext(psid);
+      const history = await getContext(userId);
 
-        let reply;
-        try {
-          reply = await askOpenRouter(text, history);
-        } catch (e) {
-          console.error("OpenRouter error:", e?.message);
-          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง 🙏";
-        }
-
-        history.push({ role: "user", content: text });
-        history.push({ role: "assistant", content: reply });
-        await setContext(psid, history);
-
-        try {
-          await sendFBMessage(psid, reply);
-        } catch (e) {
-          console.error("FB send error:", e?.message);
-        }
+      let reply;
+      try {
+        reply = await askOpenRouter(text, history);
+      } catch (e) {
+        console.error("OpenRouter error:", e?.message);
+        reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง 🙏";
       }
+
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await setContext(userId, history);
+
+      await lineClient.replyMessage(ev.replyToken, {
+        type: "text",
+        text: (reply || "").slice(0, 5000) // LINE text limit is generous; keep safe slice
+      });
+    } catch (e) {
+      console.error("Webhook handler error:", e?.message);
     }
-  } catch (e) {
-    console.error("Webhook handler error:", e?.message);
   }
 });
 
-// ---- Boot ----
+// Optional: simple health check
+app.get("/", (_req, res) => res.send("LINE bot is running"));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   await loadProducts().catch(err => {
