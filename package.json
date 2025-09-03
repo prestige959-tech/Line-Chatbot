@@ -4,7 +4,9 @@
   "description": "LINE Messaging bot connected to OpenRouter",
   "main": "index.js",
   "type": "module",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "redis": "^4.6.14",
