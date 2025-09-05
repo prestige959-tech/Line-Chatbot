@@ -72,8 +72,9 @@ async function loadProducts() {
   row.push(field); rows.push(row);
 
   const header = rows[0].map(h => h.trim().toLowerCase());
-  const nameIdx = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
+  const nameIdx  = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
   const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
+  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h)); // ← NEW
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
@@ -81,6 +82,7 @@ async function loadProducts() {
     const cols = rows[r];
     const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
     const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
+    const rawUnit  = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim(); // ← NEW
     if (!rawName) continue;
     const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric price if present
     const n = norm(rawName);
@@ -88,7 +90,7 @@ async function loadProducts() {
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    const item = { name: rawName, price, normName: n, num, keywords: kw };
+    const item = { name: rawName, price, unit: rawUnit, normName: n, num, keywords: kw }; // ← unit stored
     PRODUCTS.push(item);
     if (!NAME_INDEX.has(n)) NAME_INDEX.set(n, item);
   }
@@ -122,15 +124,121 @@ function findProduct(query) {
   return candidates[0] || null;
 }
 
+// ---- 15s silence window buffer (per user) ----
+const buffers = new Map(); // userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
+
+function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60000, maxFrags = 16) {
+  let buf = buffers.get(userId);
+  const now = Date.now();
+  if (!buf) { buf = { frags: [], timer: null, firstAt: now }; buffers.set(userId, buf); }
+
+  buf.frags.push(text);
+  if (!buf.firstAt) buf.firstAt = now;
+
+  const fire = async () => {
+    const payload = buf.frags.slice();
+    buffers.delete(userId);
+    await onReady(payload);
+  };
+
+  // safety: long sessions or too many frags → process immediately
+  if (buf.frags.length >= maxFrags || now - buf.firstAt >= maxWindowMs) {
+    if (buf.timer) clearTimeout(buf.timer);
+    buf.timer = null;
+    return void fire();
+  }
+
+  // reset "silence" timer every fragment
+  if (buf.timer) clearTimeout(buf.timer);
+  buf.timer = setTimeout(fire, silenceMs);
+}
+
+// ---- Semantic Reassembly → JSON (via OpenRouter) ----
+function heuristicJson(frags) {
+  // very safe fallback if API fails: glue text, no structure
+  const text = frags.join(" / ").trim();
+  return {
+    merged_text: text,
+    items: [],               // unknown
+    followups: [text],       // treat all as one follow-up chunk
+  };
+}
+
+async function reassembleToJSON(frags, history = []) {
+  if (!frags?.length) return heuristicJson([]);
+
+  const sys = `
+You are a Thai conversation normalizer for a shop chat.
+Input: multiple raw message fragments from a customer.
+Goal: merge them into ONE structured JSON capturing products, quantity and follow-up questions.
+
+Rules:
+- Do NOT invent products or numbers.
+- If a quantity has a unit (เส้น/ตัว/กิโล etc.), keep it.
+- If no product is clearly stated, leave items empty and put the text into followups.
+- Keep delivery/payment/stock questions as followups.
+- Output ONLY minified JSON. No markdown.
+JSON schema:
+{
+  "merged_text": "string (Thai, concise, combined)",
+  "items": [
+    {"product": "string", "qty": number|null, "unit": "string|null"}
+  ],
+  "followups": ["string", ...]
+}
+`.trim();
+
+  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
+
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot",
+        "X-Title": "line-bot reassembler json"
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: sys },
+          ...history.slice(-4),
+          { role: "user", content: user }
+        ]
+      })
+    });
+    if (!r.ok) throw new Error(`OpenRouter ${r.status}`);
+    const data = await r.json();
+    const content = data?.choices?.[0]?.message?.content?.trim();
+    if (!content) throw new Error("empty reassembler content");
+    // try parse strictly; fallback to heuristicJson on error
+    let parsed;
+    try { parsed = JSON.parse(content); }
+    catch { parsed = heuristicJson(frags); }
+    // basic shape guard
+    if (!parsed || typeof parsed !== "object" || !("merged_text" in parsed)) {
+      return heuristicJson(frags);
+    }
+    return parsed;
+  } catch (err) {
+    console.warn("Reassembler failed, using heuristic:", err?.message);
+    return heuristicJson(frags);
+  }
+}
+
 // ---- OpenRouter chat with product knowledge + history ----
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
   // Build product list for the prompt. If your catalog is huge, consider truncating or retrieving by match.
-  const productList = PRODUCTS.map(
-    p => `${p.name} = ${Number.isFinite(p.price) ? p.price + " บาท" : (p.price || "—")}`
-  ).join("\n");
+  const productList = PRODUCTS.map(p => {
+    const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
+    const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
+    return `${p.name} = ${priceTxt}${unitTxt}`;
+  }).join("\n");
 
   const systemPrompt = `
 You are a friendly Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
@@ -190,31 +298,7 @@ DELIVERY:
 - Instead, reply briefly with something like: "มีบริการส่งแล้วค่ะ ตามที่แจ้งไปก่อนหน้านี้" or answer the follow-up question directly.
 
 When questions or intents are unclear
-If you do not fully understand the customer’s request, or if their message is ambiguous, do NOT guess.  
-Instead, follow these steps:
-
-1. Politely acknowledge the uncertainty.  
-2. Ask a clarifying question to better understand their intent.  
-3. Offer 1–3 possible interpretations or examples to guide them.  
-4. Keep the tone friendly, professional, and empathetic.  
-5. Never leave the customer without a next step.  
-
-Example behavior:
-Customer: "I need that thing fixed on my account."
-Bot: "I want to make sure I get this right—are you asking about a login issue, a billing problem, or something else with your account?"
-
-ADMIN ESCALATION:
-- If customers ask about:
-  • Products not in the catalog (and no similar alternatives exist)
-  • Special requests outside the instructions
-  • Asking for a phone number or saying they want to talk to staff directly
-- Then reply:
-  "ขออภัยค่ะ เรื่องนี้ต้องให้แอดมินช่วยตรวจสอบเพิ่มเติม กรุณาโทร 088-277-0145 นะคะ"
-  → Do not attempt to answer further.
-
-EXTRAS:
-- If appropriate, you may suggest related products to upsell.
-- Keep the experience warm and service-oriented, like a real shop assistant.
+(…unchanged…)
 `.trim();
 
   try {
@@ -271,23 +355,51 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       const history = await getContext(userId);
 
-      let reply;
-      try {
-        reply = await askOpenRouter(text, history);
-      } catch (e) {
-        console.error("OpenRouter error:", e?.message);
-        reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
-      }
+      // ← NEW: push into 15s silence buffer; when timer fires, reassemble to JSON then ask model once
+      pushFragment(userId, text, async (frags) => {
+        const parsed = await reassembleToJSON(frags, history);
 
-      history.push({ role: "user", content: text });
-      history.push({ role: "assistant", content: reply });
-      await setContext(userId, history);
+        // Build a clean merged text from JSON for the assistant model
+        // Example: turn structured items into concise Thai text the assistant can answer deterministically.
+        let mergedForAssistant = parsed.merged_text || frags.join(" / ");
+        if (parsed.items?.length) {
+          const itemsPart = parsed.items
+            .map(it => {
+              const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
+              const unit = it.unit ? ` ${it.unit}` : "";
+              return `${it.product || ""}${qty}${unit}`.trim();
+            })
+            .filter(Boolean)
+            .join(" / ");
+          mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
+        }
 
-      // LINE text message limit ~5000 chars
-      await lineClient.replyMessage(ev.replyToken, {
-        type: "text",
-        text: (reply || "").slice(0, 5000)
-      });
+        let reply;
+        try {
+          reply = await askOpenRouter(mergedForAssistant, history);
+        } catch (e) {
+          console.error("OpenRouter error:", e?.message);
+          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+        }
+
+        // Persist: raw fragments, JSON summary, merged text, and assistant reply
+        for (const f of frags) history.push({ role: "user", content: f });
+        history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
+        history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
+        history.push({ role: "assistant", content: reply });
+        await setContext(userId, history);
+
+        // LINE text message limit ~5000 chars
+        try {
+          await lineClient.replyMessage(ev.replyToken, {
+            type: "text",
+            text: (reply || "").slice(0, 5000)
+          });
+        } catch (err) {
+          console.warn("Reply failed (possibly expired token):", err?.message);
+          // Optional: if you enable Push API, you could send a push here as fallback
+        }
+      }, /* silenceMs */ 15000); // ← 15s silence window
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
