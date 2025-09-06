@@ -1,4 +1,4 @@
-// index.js (LINE version) — adjusted
+// index.js (LINE version)
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -7,15 +7,10 @@ import { getContext, setContext } from "./chatMemory.js";
 const app = express();
 
 // ---- ENV ----
-const LINE_ACCESS_TOKEN   = (process.env.LINE_ACCESS_TOKEN || "").trim();
+const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
 const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
-const OPENROUTER_API_KEY  = (process.env.OPENROUTER_API_KEY || "").trim();
-const MODEL               = process.env.MODEL || "moonshotai/kimi-k2";
-
-// NEW: Buffer controls via ENV (with safe defaults)
-const SILENCE_MS    = Number(process.env.SILENCE_MS || 15000); // wait-for-silence window
-const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000); // absolute cap from first frag
-const MAX_FRAGS     = Number(process.env.MAX_FRAGS || 16); // max buffered fragments
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
+const MODEL = process.env.MODEL || "moonshotai/kimi-k2";
 
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
@@ -23,9 +18,6 @@ console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 console.log("ENV → LINE_CHANNEL_SECRET:", mask(LINE_CHANNEL_SECRET));
 console.log("ENV → OPENROUTER_API_KEY:", mask(OPENROUTER_API_KEY));
 console.log("ENV → MODEL:", MODEL);
-console.log("ENV → SILENCE_MS:", SILENCE_MS);
-console.log("ENV → MAX_WINDOW_MS:", MAX_WINDOW_MS);
-console.log("ENV → MAX_FRAGS:", MAX_FRAGS);
 
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.warn("⚠️ Missing LINE credentials — webhook will not work correctly.");
@@ -82,17 +74,17 @@ async function loadProducts() {
   const header = rows[0].map(h => h.trim().toLowerCase());
   const nameIdx  = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
   const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
-  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h)); // unit column
+  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-    const rawName  = (cols[nameIdx  !== -1 ? nameIdx  : 0] || "").trim();
+    const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
     const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
     const rawUnit  = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim();
     if (!rawName) continue;
-    const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric price if present
+    const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric if present
     const n = norm(rawName);
     const kw = tokens(rawName);
     const codeMatch = rawName.match(/#\s*(\d+)/);
@@ -132,18 +124,21 @@ function findProduct(query) {
   return candidates[0] || null;
 }
 
-// ---- 15s silence window buffer (per user) ----
-// userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
-const buffers = new Map();
+// ---- Multi-match helpers for listing variants ----
+function listProductsByTerm(term) {
+  const t = norm(term);
+  return PRODUCTS.filter(p => norm(p.name).includes(t));
+}
+function formatPriceLine(p) {
+  const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : "กรุณาโทร 088-277-0145";
+  const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
+  return `• ${p.name} ราคา ${priceTxt}${unitTxt}`;
+}
 
-function pushFragment(
-  userId,
-  text,
-  onReady,
-  silenceMs = 15000,
-  maxWindowMs = 60000,
-  maxFrags = 16
-) {
+// ---- 15s silence window buffer (per user) ----
+const buffers = new Map(); // userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
+
+function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60000, maxFrags = 16) {
   let buf = buffers.get(userId);
   const now = Date.now();
   if (!buf) { buf = { frags: [], timer: null, firstAt: now }; buffers.set(userId, buf); }
@@ -241,13 +236,6 @@ JSON schema:
   }
 }
 
-// ---- helper: detect if delivery was already explained in this conversation ----
-function deliveryExplainedIn(history = []) {
-  // heuristics: look for assistant delivery info signals
-  const rx = /(Lalamove|กทม\.|กรุงเทพฯ|ปริมณฑล|ค่าส่งลูกค้าชำระเอง|ไม่มีทีมบริการยกลง)/i;
-  return history.some(m => m?.role === "assistant" && rx.test(m?.content || ""));
-}
-
 // ---- OpenRouter chat with product knowledge + history ----
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
@@ -259,76 +247,42 @@ async function askOpenRouter(userText, history = []) {
     return `${p.name} = ${priceTxt}${unitTxt}`;
   }).join("\n");
 
-  const alreadyExplained = deliveryExplainedIn(history);
-  const deliveryFlag = alreadyExplained
-    ? "\nCONTEXT FLAG: DELIVERY_ALREADY_EXPLAINED=true\n"
-    : "\nCONTEXT FLAG: DELIVERY_ALREADY_EXPLAINED=false\n";
-
   const systemPrompt = `
-You are a friendly female Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
-${deliveryFlag}
+You are a friendly Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
+
 PRODUCT CATALOG:
 ${productList}
 
 INSTRUCTIONS:
 - Answer in Thai language naturally and conversationally.
-- Be polite and concise. Always use ค่ะ / นะคะ.
 - When customers ask about prices, reply with only the product name, the unit price, and the total price (if quantity is given).
-- Always include the unit from the "unit" column (e.g., "ต่อ กก.", "ต่อ กล่อง").
-- Ignore bundle/pack/set terms. Always return to base unit (e.g., เส้น, ชิ้น).
-- If product not found, suggest similar products or ask for clarification.
-- Use Arabic numerals (25, 100). Do not use Thai numerals.
-- If the user asks about a generic category name (e.g., "ฉาก") that matches multiple products in the catalog, 
-  list all matching items with their unit prices. Show each on a separate line, concise, no extra explanations.
-  Example:
-  ลูกค้า: "ฉาก ราคาเท่าไหร่"
-  Bot:
-  • ฉากริมสังกะสี ราคา 120 บาทต่อเส้น
-  • ฉาก 2 รู ราคา 95 บาทต่อเส้น
+- Always include the unit after the price from unit column (e.g., "ต่อ กก.", "ต่อ กล่อง").
+- Do NOT add order confirmations, payment details, or extra text unless the customer specifically asks about them.
+- If a product isn't found, suggest similar products or ask for clarification.
+- Be helpful, polite, and use appropriate Thai politeness particles (ค่ะ, ครับ, นะคะ, นะครับ).
+- Keep responses very concise and friendly.
+- Always use the unit from the unit column in the price file only.
+    If customer messages or marketing texts mention bundle terms like "มัด", "แพ็ค", or "ชุด", ignore them and convert back to the correct unit from the file.
+- If the user asks a generic category that matches multiple products (เช่น "ฉาก" หรือ "ฉากริมสังกะสี"), list **all** matching items with their unit prices, one per line, concise, no extra commentary.
 
-
-PRICING & QUANTITY:
-- Treat catalog price as per-piece price. Total = quantity × price.
-- If catalog "unit" has bundle wording, ignore bundle size, keep only base unit.
-- Reply format (with quantity):
-  "[product] [qty] ราคา [price] บาทต่อ[unit] ค่ะ  
-   รวมทั้งหมด [qty×price] บาท ค่ะ"
+PRICING & QUANTITY (MANDATORY — PIECES ONLY):
+- We sell by pieces only. Never require bundles, sets, packs, or minimum quantities.
+- Treat the CSV price as the per-piece price. Total = (customer requested quantity) × (price).
+- If the CSV "unit" text contains bundle wording, IGNORE the bundle size and use the base piece unit only.
+- When the customer specifies a quantity, compute and state the total.
+- If the exact price is missing, do not guess. Escalate: "กรุณาโทร 088-277-0145".
+- Keep answers concise. Do not re-explain delivery or policies unless asked.
 
 SUMMARY OF ORDER:
-- If asked for "รวมทั้งหมด", list all selected items with subtotal then final sum.
-- Format:
-  - [product] [qty] ราคา [unit price] บาทต่อ[unit] = [subtotal] บาท
-  - รวมทั้งหมด [TOTAL] บาท ค่ะ
-- If no prior items: "ยังไม่มีสินค้าที่เลือกไว้ค่ะ กรุณาระบุสินค้าที่ต้องการก่อนนะคะ"
+- If the customer asks for a sum, list each item with subtotal then show the final total.
 
 ORDER & PAYMENT:
-- Confirm only if customer explicitly orders: 
-  "คุณลูกค้าต้องการสั่ง [product] [qty] รวม [total] บาท ใช่ไหมคะ?"
-- Payment: โอนก่อนเท่านั้น. If asked about COD: 
-  "ขออภัยค่ะ ทางร้านรับชำระแบบโอนก่อนเท่านั้น ไม่รับเก็บเงินปลายทางค่ะ"
+- If a customer wants to order, confirm succinctly.
+- Payment method: โอนก่อนเท่านั้น. If asked: "ขออภัยค่ะ ทางร้านรับชำระแบบโอนก่อนเท่านั้น ไม่รับเงินสดหรือเก็บเงินปลายทางค่ะ"
 
 DELIVERY:
-- First time explanation (if customer asks "ส่งไหม", "มีบริการส่งไหม", etc.):  
-  "บริษัทเรามีบริการจัดส่งโดยใช้ Lalamove ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ  
-   ลูกค้าชำระค่าขนส่งเองนะคะ  
-   ทางร้านไม่มีทีมบริการยกลง ลูกค้าต้องจัดหาคนช่วยยกลงเองค่ะ"
-
-- ANTI-REPEAT RULE (delivery only):
-  If DELIVERY_ALREADY_EXPLAINED=true in this conversation, do NOT repeat the full explanation.
-  Respond briefly and politely, e.g.:
-    • "มีบริการส่งโดยใช้ Lalamove ค่ะ"
-    • "ส่งได้ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ"
-    • Or answer the specific follow-up (e.g., cost, free delivery, timing) directly.
-  Avoid phrasing that references prior messages explicitly (e.g., do not say phrases equivalent to "as mentioned earlier").
-
-MISSING PRICE HANDLING:
-- If product price is missing from catalog → reply: "กรุณาโทร 088-277-0145".
-
-UNCLEAR INTENT:
-- If questions or intents are unclear: ask one short clarifying question in Thai, or suggest the closest matching products.
-
-PRIVACY:
-- Do NOT reveal internal flags or merged JSON to the user.
+- If asked about delivery: explain Lalamove (BKK & vicinity), shop calls the car, customer pays shipping, no unloading team.
+- If asked again, avoid repeating the whole block; be brief.
 `.trim();
 
   try {
@@ -385,60 +339,80 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       const history = await getContext(userId);
 
-      // push into silence buffer; when timer fires, reassemble to JSON then ask model once
-      pushFragment(
-        userId,
-        text,
-        async (frags) => {
-          const parsed = await reassembleToJSON(frags, history);
+      // push into 15s silence buffer; when timer fires, reassemble to JSON then ask once
+      pushFragment(userId, text, async (frags) => {
+        const parsed = await reassembleToJSON(frags, history);
 
-          // Build a clean merged text from JSON for the assistant model
-          let mergedForAssistant = parsed.merged_text || frags.join(" / ");
-          if (parsed.items?.length) {
-            const itemsPart = parsed.items
-              .map(it => {
-                const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
-                const unit = it.unit ? ` ${it.unit}` : "";
-                return `${it.product || ""}${qty}${unit}`.trim();
-              })
-              .filter(Boolean)
-              .join(" / ");
-            const follow = (parsed.followups?.length ? parsed.followups.join(" / ") : "");
-            mergedForAssistant = [itemsPart, follow].filter(Boolean).join(" / ");
-          }
+        // Build a clean merged text for the assistant model
+        let mergedForAssistant = parsed.merged_text || frags.join(" / ");
+        if (parsed.items?.length) {
+          const itemsPart = parsed.items
+            .map(it => {
+              const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
+              const unit = it.unit ? ` ${it.unit}` : "";
+              return `${it.product || ""}${qty}${unit}`.trim();
+            })
+            .filter(Boolean)
+            .join(" / ");
+          mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
+        }
 
-          let reply;
-          try {
-            reply = await askOpenRouter(mergedForAssistant, history);
-          } catch (e) {
-            console.error("OpenRouter error:", e?.message);
-            reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
-          }
+        // ---- NEW: deterministic listing for ฉาก / ฉากริมสังกะสี
+        const qn = norm(mergedForAssistant);
+        let repliedWithList = false;
+        const replyListFor = async (term) => {
+          const matches = listProductsByTerm(term);
+          if (!matches.length) return false;
 
-          // Persist: raw fragments and assistant reply (avoid saving internal JSON as user messages)
-          for (const f of frags) history.push({ role: "user", content: f });
-          // If you want to keep a trace, store as a system/internal note (optional):
-          // history.push({ role: "system", content: `[INTERNAL] JSON: ${JSON.stringify(parsed)}` });
-          // history.push({ role: "system", content: `[INTERNAL] MERGED: ${mergedForAssistant}` });
+          // stable ordering
+          matches.sort((a, b) => a.name.localeCompare(b.name, "th"));
 
+          const lines = matches.map(formatPriceLine);
+          const reply = `ในร้านเรามี${term} ${matches.length} แบบนะคะ\n` + lines.join("\n");
+
+          // persist & reply
           history.push({ role: "assistant", content: reply });
           await setContext(userId, history);
-
-          // LINE text message limit ~5000 chars
           try {
-            await lineClient.replyMessage(ev.replyToken, {
-              type: "text",
-              text: (reply || "").slice(0, 5000)
-            });
+            await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
           } catch (err) {
             console.warn("Reply failed (possibly expired token):", err?.message);
           }
-        },
-        // Use ENV-configured values here
-        SILENCE_MS,
-        MAX_WINDOW_MS,
-        MAX_FRAGS
-      );
+          return true;
+        };
+
+        if (qn.includes("ฉากริมสังกะสี")) {
+          repliedWithList = await replyListFor("ฉากริมสังกะสี");
+        } else if (qn.includes("ฉาก")) {
+          repliedWithList = await replyListFor("ฉาก");
+        }
+        if (repliedWithList) return; // do not continue to LLM for this turn
+
+        // ---- fallback: normal LLM flow ----
+        let reply;
+        try {
+          reply = await askOpenRouter(mergedForAssistant, history);
+        } catch (e) {
+          console.error("OpenRouter error:", e?.message);
+          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+        }
+
+        // Persist: raw fragments, JSON summary, merged text, and assistant reply
+        for (const f of frags) history.push({ role: "user", content: f });
+        history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
+        history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
+        history.push({ role: "assistant", content: reply });
+        await setContext(userId, history);
+
+        try {
+          await lineClient.replyMessage(ev.replyToken, {
+            type: "text",
+            text: (reply || "").slice(0, 5000)
+          });
+        } catch (err) {
+          console.warn("Reply failed (possibly expired token):", err?.message);
+        }
+      }, /* silenceMs */ 15000);
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
