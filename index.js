@@ -253,7 +253,7 @@ async function askOpenRouter(userText, history = []) {
   }).join("\n");
 
   const systemPrompt = `
-You are a friendly Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
+You are a friendly female Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
 
 PRODUCT CATALOG:
 ${productList}
