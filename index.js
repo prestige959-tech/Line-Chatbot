@@ -1,4 +1,4 @@
-// index.js (LINE version)
+// index.js (LINE version) — adjusted
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -206,12 +206,12 @@ JSON schema:
   const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
 
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions ", {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot ",
+        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot",
         "X-Title": "line-bot reassembler json"
       },
       body: JSON.stringify({
@@ -241,6 +241,13 @@ JSON schema:
   }
 }
 
+// ---- helper: detect if delivery was already explained in this conversation ----
+function deliveryExplainedIn(history = []) {
+  // heuristics: look for assistant delivery info signals
+  const rx = /(Lalamove|กทม\.|กรุงเทพฯ|ปริมณฑล|ค่าส่งลูกค้าชำระเอง|ไม่มีทีมบริการยกลง)/i;
+  return history.some(m => m?.role === "assistant" && rx.test(m?.content || ""));
+}
+
 // ---- OpenRouter chat with product knowledge + history ----
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
@@ -252,25 +259,31 @@ async function askOpenRouter(userText, history = []) {
     return `${p.name} = ${priceTxt}${unitTxt}`;
   }).join("\n");
 
+  const alreadyExplained = deliveryExplainedIn(history);
+  const deliveryFlag = alreadyExplained
+    ? "\nCONTEXT FLAG: DELIVERY_ALREADY_EXPLAINED=true\n"
+    : "\nCONTEXT FLAG: DELIVERY_ALREADY_EXPLAINED=false\n";
+
   const systemPrompt = `
 You are a friendly female Thai shop assistant chatbot. You help customers with product inquiries in a natural, conversational way.
-
+${deliveryFlag}
 PRODUCT CATALOG:
 ${productList}
 
 INSTRUCTIONS:
-- Always answer in polite, natural Thai. Use ค่ะ/นะคะ consistently.
-- Prices: Reply only with product name, unit price, and total if quantity given. Always include the correct unit from "unit" column.
-- Ignore "bundle/pack/set" terms. Always return to base unit (e.g., เส้น, ชิ้น).
-- Use Arabic numerals (e.g., 25, 100).
-- If product not found, suggest closest match or ask for clarification.
-- Be concise, friendly, and polite even if customer is rude.
+- Answer in Thai language naturally and conversationally.
+- Be polite and concise. Always use ค่ะ / นะคะ.
+- When customers ask about prices, reply with only the product name, the unit price, and the total price (if quantity is given).
+- Always include the unit from the "unit" column (e.g., "ต่อ กก.", "ต่อ กล่อง").
+- Ignore bundle/pack/set terms. Always return to base unit (e.g., เส้น, ชิ้น).
+- If product not found, suggest similar products or ask for clarification.
+- Use Arabic numerals (25, 100). Do not use Thai numerals.
 
 PRICING & QUANTITY:
 - Treat catalog price as per-piece price. Total = quantity × price.
 - If catalog "unit" has bundle wording, ignore bundle size, keep only base unit.
 - Reply format (with quantity):
-  "[product] [qty] ราคา [price] บาทต่อ[unit] ค่ะ
+  "[product] [qty] ราคา [price] บาทต่อ[unit] ค่ะ  
    รวมทั้งหมด [qty×price] บาท ค่ะ"
 
 SUMMARY OF ORDER:
@@ -287,28 +300,37 @@ ORDER & PAYMENT:
   "ขออภัยค่ะ ทางร้านรับชำระแบบโอนก่อนเท่านั้น ไม่รับเก็บเงินปลายทางค่ะ"
 
 DELIVERY:
-- First time explain: 
-  "เราส่งด้วย Lalamove ใน กทม. และปริมณฑล ลูกค้าจ่ายค่าส่งเองนะคะ ไม่มีทีมยกลงค่ะ"
-- If already explained, reply briefly: 
-  "มีบริการส่งแล้วค่ะ ตามที่แจ้งไปก่อนหน้านี้"
+- First time explanation (if customer asks "ส่งไหม", "มีบริการส่งไหม", etc.):  
+  "บริษัทเรามีบริการจัดส่งโดยใช้ Lalamove ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ  
+   ลูกค้าชำระค่าขนส่งเองนะคะ  
+   ทางร้านไม่มีทีมบริการยกลง ลูกค้าต้องจัดหาคนช่วยยกลงเองค่ะ"
 
-MEMORY & FLEXIBILITY:
-- Remember selected items across the same conversation.
-- Accept minor typos or alternative product names. Match to the closest catalog item.
-- Never add order confirmations, policies, or payment unless asked.
+- ANTI-REPEAT RULE (delivery only):
+  If DELIVERY_ALREADY_EXPLAINED=true in this conversation, do NOT repeat the full explanation.
+  Respond briefly and politely, e.g.:
+    • "มีบริการส่งโดยใช้ Lalamove ค่ะ"
+    • "ส่งได้ในพื้นที่กรุงเทพฯ และปริมณฑลค่ะ"
+    • Or answer the specific follow-up (e.g., cost, free delivery, timing) directly.
+  Avoid phrasing that references prior messages explicitly (e.g., do not say phrases equivalent to "as mentioned earlier").
 
-When questions or intents are unclear
-(…unchanged…)
+MISSING PRICE HANDLING:
+- If product price is missing from catalog → reply: "กรุณาโทร 088-277-0145".
+
+UNCLEAR INTENT:
+- If questions or intents are unclear: ask one short clarifying question in Thai, or suggest the closest matching products.
+
+PRIVACY:
+- Do NOT reveal internal flags or merged JSON to the user.
 `.trim();
 
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions ", {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices ",
+        "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices",
         "X-Title": "my-shop-prices line-bot"
       },
       body: JSON.stringify({
@@ -373,7 +395,8 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
               })
               .filter(Boolean)
               .join(" / ");
-            mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
+            const follow = (parsed.followups?.length ? parsed.followups.join(" / ") : "");
+            mergedForAssistant = [itemsPart, follow].filter(Boolean).join(" / ");
           }
 
           let reply;
@@ -384,10 +407,12 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
             reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
           }
 
-          // Persist: raw fragments, JSON summary, merged text, and assistant reply
+          // Persist: raw fragments and assistant reply (avoid saving internal JSON as user messages)
           for (const f of frags) history.push({ role: "user", content: f });
-          history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
-          history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
+          // If you want to keep a trace, store as a system/internal note (optional):
+          // history.push({ role: "system", content: `[INTERNAL] JSON: ${JSON.stringify(parsed)}` });
+          // history.push({ role: "system", content: `[INTERNAL] MERGED: ${mergedForAssistant}` });
+
           history.push({ role: "assistant", content: reply });
           await setContext(userId, history);
 
