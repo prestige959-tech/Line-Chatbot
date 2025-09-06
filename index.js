@@ -7,10 +7,15 @@ import { getContext, setContext } from "./chatMemory.js";
 const app = express();
 
 // ---- ENV ----
-const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
+const LINE_ACCESS_TOKEN   = (process.env.LINE_ACCESS_TOKEN || "").trim();
 const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
-const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
-const MODEL = process.env.MODEL || "moonshotai/kimi-k2";
+const OPENROUTER_API_KEY  = (process.env.OPENROUTER_API_KEY || "").trim();
+const MODEL               = process.env.MODEL || "moonshotai/kimi-k2";
+
+// NEW: Buffer controls via ENV (with safe defaults)
+const SILENCE_MS    = Number(process.env.SILENCE_MS || 15000); // wait-for-silence window
+const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000); // absolute cap from first frag
+const MAX_FRAGS     = Number(process.env.MAX_FRAGS || 16); // max buffered fragments
 
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
@@ -18,6 +23,9 @@ console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 console.log("ENV → LINE_CHANNEL_SECRET:", mask(LINE_CHANNEL_SECRET));
 console.log("ENV → OPENROUTER_API_KEY:", mask(OPENROUTER_API_KEY));
 console.log("ENV → MODEL:", MODEL);
+console.log("ENV → SILENCE_MS:", SILENCE_MS);
+console.log("ENV → MAX_WINDOW_MS:", MAX_WINDOW_MS);
+console.log("ENV → MAX_FRAGS:", MAX_FRAGS);
 
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.warn("⚠️ Missing LINE credentials — webhook will not work correctly.");
@@ -74,15 +82,15 @@ async function loadProducts() {
   const header = rows[0].map(h => h.trim().toLowerCase());
   const nameIdx  = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
   const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
-  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h)); // ← NEW
+  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h)); // unit column
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-    const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
+    const rawName  = (cols[nameIdx  !== -1 ? nameIdx  : 0] || "").trim();
     const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
-    const rawUnit  = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim(); // ← NEW
+    const rawUnit  = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim();
     if (!rawName) continue;
     const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric price if present
     const n = norm(rawName);
@@ -90,7 +98,7 @@ async function loadProducts() {
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    const item = { name: rawName, price, unit: rawUnit, normName: n, num, keywords: kw }; // ← unit stored
+    const item = { name: rawName, price, unit: rawUnit, normName: n, num, keywords: kw };
     PRODUCTS.push(item);
     if (!NAME_INDEX.has(n)) NAME_INDEX.set(n, item);
   }
@@ -125,9 +133,17 @@ function findProduct(query) {
 }
 
 // ---- 15s silence window buffer (per user) ----
-const buffers = new Map(); // userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
+// userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
+const buffers = new Map();
 
-function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60000, maxFrags = 16) {
+function pushFragment(
+  userId,
+  text,
+  onReady,
+  silenceMs = 15000,
+  maxWindowMs = 60000,
+  maxFrags = 16
+) {
   let buf = buffers.get(userId);
   const now = Date.now();
   if (!buf) { buf = { frags: [], timer: null, firstAt: now }; buffers.set(userId, buf); }
@@ -155,12 +171,11 @@ function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60
 
 // ---- Semantic Reassembly → JSON (via OpenRouter) ----
 function heuristicJson(frags) {
-  // very safe fallback if API fails: glue text, no structure
   const text = frags.join(" / ").trim();
   return {
     merged_text: text,
-    items: [],               // unknown
-    followups: [text],       // treat all as one follow-up chunk
+    items: [],
+    followups: [text],
   };
 }
 
@@ -191,12 +206,12 @@ JSON schema:
   const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
 
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions ", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot",
+        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot ",
         "X-Title": "line-bot reassembler json"
       },
       body: JSON.stringify({
@@ -213,11 +228,9 @@ JSON schema:
     const data = await r.json();
     const content = data?.choices?.[0]?.message?.content?.trim();
     if (!content) throw new Error("empty reassembler content");
-    // try parse strictly; fallback to heuristicJson on error
     let parsed;
     try { parsed = JSON.parse(content); }
     catch { parsed = heuristicJson(frags); }
-    // basic shape guard
     if (!parsed || typeof parsed !== "object" || !("merged_text" in parsed)) {
       return heuristicJson(frags);
     }
@@ -233,7 +246,6 @@ async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
-  // Build product list for the prompt. If your catalog is huge, consider truncating or retrieving by match.
   const productList = PRODUCTS.map(p => {
     const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
     const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
@@ -302,13 +314,13 @@ When questions or intents are unclear
 `.trim();
 
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const r = await fetch("https://openrouter.ai/api/v1/chat/completions ", {
       method: "POST",
       signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices",
+        "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices ",
         "X-Title": "my-shop-prices line-bot"
       },
       body: JSON.stringify({
@@ -355,51 +367,57 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       const history = await getContext(userId);
 
-      // ← NEW: push into 15s silence buffer; when timer fires, reassemble to JSON then ask model once
-      pushFragment(userId, text, async (frags) => {
-        const parsed = await reassembleToJSON(frags, history);
+      // push into silence buffer; when timer fires, reassemble to JSON then ask model once
+      pushFragment(
+        userId,
+        text,
+        async (frags) => {
+          const parsed = await reassembleToJSON(frags, history);
 
-        // Build a clean merged text from JSON for the assistant model
-        // Example: turn structured items into concise Thai text the assistant can answer deterministically.
-        let mergedForAssistant = parsed.merged_text || frags.join(" / ");
-        if (parsed.items?.length) {
-          const itemsPart = parsed.items
-            .map(it => {
-              const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
-              const unit = it.unit ? ` ${it.unit}` : "";
-              return `${it.product || ""}${qty}${unit}`.trim();
-            })
-            .filter(Boolean)
-            .join(" / ");
-          mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
-        }
+          // Build a clean merged text from JSON for the assistant model
+          let mergedForAssistant = parsed.merged_text || frags.join(" / ");
+          if (parsed.items?.length) {
+            const itemsPart = parsed.items
+              .map(it => {
+                const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
+                const unit = it.unit ? ` ${it.unit}` : "";
+                return `${it.product || ""}${qty}${unit}`.trim();
+              })
+              .filter(Boolean)
+              .join(" / ");
+            mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
+          }
 
-        let reply;
-        try {
-          reply = await askOpenRouter(mergedForAssistant, history);
-        } catch (e) {
-          console.error("OpenRouter error:", e?.message);
-          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
-        }
+          let reply;
+          try {
+            reply = await askOpenRouter(mergedForAssistant, history);
+          } catch (e) {
+            console.error("OpenRouter error:", e?.message);
+            reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+          }
 
-        // Persist: raw fragments, JSON summary, merged text, and assistant reply
-        for (const f of frags) history.push({ role: "user", content: f });
-        history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
-        history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
-        history.push({ role: "assistant", content: reply });
-        await setContext(userId, history);
+          // Persist: raw fragments, JSON summary, merged text, and assistant reply
+          for (const f of frags) history.push({ role: "user", content: f });
+          history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
+          history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
+          history.push({ role: "assistant", content: reply });
+          await setContext(userId, history);
 
-        // LINE text message limit ~5000 chars
-        try {
-          await lineClient.replyMessage(ev.replyToken, {
-            type: "text",
-            text: (reply || "").slice(0, 5000)
-          });
-        } catch (err) {
-          console.warn("Reply failed (possibly expired token):", err?.message);
-          // Optional: if you enable Push API, you could send a push here as fallback
-        }
-      }, /* silenceMs */ 15000); // ← 15s silence window
+          // LINE text message limit ~5000 chars
+          try {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: (reply || "").slice(0, 5000)
+            });
+          } catch (err) {
+            console.warn("Reply failed (possibly expired token):", err?.message);
+          }
+        },
+        // Use ENV-configured values here
+        SILENCE_MS,
+        MAX_WINDOW_MS,
+        MAX_FRAGS
+      );
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
