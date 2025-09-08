@@ -1,4 +1,4 @@
-// index.js (LINE + OpenRouter, with image receipt handling)
+// index.js (LINE version)
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -10,10 +10,7 @@ const app = express();
 const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
 const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
-
-// Use a vision-capable model if you want image OCR (e.g. openai/gpt-4o-mini, claude-3.5-sonnet, gemini-1.5-flash)
-// Text-only models like deepseek/deepseek-chat-v3.1 cannot interpret images.
-const MODEL = process.env.MODEL || "openai/gpt-4o-mini";
+const MODEL = process.env.MODEL || "moonshotai/kimi-k2";
 
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
@@ -47,59 +44,6 @@ function tokens(s) {
   const t = (s || "").toLowerCase();
   const m = t.match(/[#]?\d+|[a-zA-Zก-๙]+/g);
   return m || [];
-}
-
-// --- helpers for image handling ---
-async function streamToBuffer(stream) {
-  const chunks = [];
-  for await (const chunk of stream) chunks.push(chunk);
-  return Buffer.concat(chunks);
-}
-
-// Send image (as base64) to a vision model on OpenRouter to extract fields
-async function interpretReceiptWithVLM(imageBuf) {
-  const b64 = imageBuf.toString("base64");
-  const sys = "Return JSON only, no markdown or explanations.";
-  const prompt = `
-You are reading Thai bank transfer receipts.
-Extract these keys; use null when unknown:
-- amount_thb (number, e.g. 1234.56)
-- transfer_time (string exactly as on slip)
-- reference (string; ref/trace id)
-- sender_last4 (string; last 4 of sender account)
-- receiver_name (string)
-- bank (string)
-Return minified JSON.
-`.trim();
-
-  const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-      "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot",
-      "X-Title": "receipt-vision"
-    },
-    body: JSON.stringify({
-      model: MODEL || "openai/gpt-4o-mini",
-      temperature: 0,
-      messages: [
-        { role: "system", content: sys },
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${b64}` } }
-          ]
-        }
-      ]
-    })
-  });
-
-  if (!r.ok) throw new Error(`OpenRouter ${r.status}`);
-  const data = await r.json();
-  const raw = data?.choices?.[0]?.message?.content?.trim() || "{}";
-  try { return JSON.parse(raw); } catch { return {}; }
 }
 
 // ---- CSV load & product index ----
@@ -378,143 +322,6 @@ DELIVERY:
   }
 }
 
-// ---- TEXT & IMAGE handlers ----
-
-async function handleTextMessage(ev) {
-  const userId = ev?.source?.userId;
-  const text = ev?.message?.text?.trim();
-  if (!userId || !text) return;
-
-  console.log("IN (text):", { userId, text });
-  const history = await getContext(userId);
-
-  // push into 15s silence buffer; when timer fires, reassemble to JSON then ask once
-  pushFragment(userId, text, async (frags) => {
-    const parsed = await reassembleToJSON(frags, history);
-
-    // Build a clean merged text for the assistant model
-    let mergedForAssistant = parsed.merged_text || frags.join(" / ");
-    if (parsed.items?.length) {
-      const itemsPart = parsed.items
-        .map(it => {
-          const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
-          const unit = it.unit ? ` ${it.unit}` : "";
-          return `${it.product || ""}${qty}${unit}`.trim();
-        })
-        .filter(Boolean)
-        .join(" / ");
-      mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
-    }
-
-    // ---- NEW: deterministic listing for ฉาก / ฉากริมสังกะสี
-    const qn = norm(mergedForAssistant);
-    let repliedWithList = false;
-    const replyListFor = async (term) => {
-      const matches = listProductsByTerm(term);
-      if (!matches.length) return false;
-
-      // stable ordering
-      matches.sort((a, b) => a.name.localeCompare(b.name, "th"));
-
-      const lines = matches.map(formatPriceLine);
-      const reply = `ในร้านเรามี${term} ${matches.length} แบบนะคะ\n` + lines.join("\n");
-
-      // persist & reply
-      history.push({ role: "assistant", content: reply });
-      await setContext(userId, history);
-      try {
-        await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
-      } catch (err) {
-        console.warn("Reply failed (possibly expired token):", err?.message);
-      }
-      return true;
-    };
-
-    if (qn.includes("ฉากริมสังกะสี")) {
-      repliedWithList = await replyListFor("ฉากริมสังกะสี");
-    } else if (qn.includes("ฉาก")) {
-      repliedWithList = await replyListFor("ฉาก");
-    }
-    if (repliedWithList) return; // do not continue to LLM for this turn
-
-    // ---- fallback: normal LLM flow ----
-    let reply;
-    try {
-      reply = await askOpenRouter(mergedForAssistant, history);
-    } catch (e) {
-      console.error("OpenRouter error:", e?.message);
-      reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
-    }
-
-    // Persist: raw fragments, JSON summary, merged text, and assistant reply
-    for (const f of frags) history.push({ role: "user", content: f });
-    history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
-    history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
-    history.push({ role: "assistant", content: reply });
-    await setContext(userId, history);
-
-    try {
-      await lineClient.replyMessage(ev.replyToken, {
-        type: "text",
-        text: (reply || "").slice(0, 5000)
-      });
-    } catch (err) {
-      console.warn("Reply failed (possibly expired token):", err?.message);
-    }
-  }, /* silenceMs */ 15000);
-}
-
-async function handleReceiptMessage(ev) {
-  const userId = ev?.source?.userId;
-  if (!userId) return;
-
-  try {
-    // 1) Download the image bytes from LINE
-    const contentStream = await lineClient.getMessageContent(ev.message.id);
-    const buf = await streamToBuffer(contentStream);
-
-    // 2) Send to the vision model to pre-extract fields (assistive only)
-    let extracted = {};
-    try {
-      extracted = await interpretReceiptWithVLM(buf);
-    } catch (e) {
-      console.warn("Vision extraction failed:", e?.message);
-    }
-
-    // 3) Save minimal context so you can reconcile later (do NOT auto-confirm)
-    const history = await getContext(userId);
-    history.push({ role: "system", content: `(receipt-upload) bytes=${buf.length}` });
-    history.push({ role: "system", content: `(receipt-vlm) ${JSON.stringify(extracted)}` });
-    await setContext(userId, history);
-
-    // 4) Ask user to confirm the 3 key fields (prefill what we think we saw)
-    const prefill = [
-      Number.isFinite(extracted?.amount_thb) ? `ยอด: ${extracted.amount_thb} บาท` : null,
-      extracted?.transfer_time ? `เวลา: ${extracted.transfer_time}` : null,
-      extracted?.reference ? `อ้างอิง: ${extracted.reference}` : null
-    ].filter(Boolean).join("\n");
-
-    const reply =
-      "รับรูปสลิปแล้วค่ะ ✨\n" +
-      (prefill ? `ที่เห็นบนสลิป:\n${prefill}\n\n` : "") +
-      "เพื่อเช็กยอดให้ไว รบกวนยืนยัน 3 ข้อนะคะ:\n" +
-      "1) จำนวนเงินที่โอน\n" +
-      "2) เวลา/วันที่โอน (ตามสลิป)\n" +
-      "3) เลขอ้างอิง หรือ 4 ตัวท้ายบัญชีผู้โอน\n\n" +
-      "ยืนยันมาในแชตได้เลยค่ะ แล้วจะยืนยันให้หลังตรวจสอบนะคะ 🙏";
-
-    await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply });
-  } catch (err) {
-    console.error("handleReceiptMessage error:", err?.message);
-    try {
-      await lineClient.replyMessage(ev.replyToken, {
-        type: "text",
-        text: "ขอโทษค่ะ รับไฟล์ไม่สำเร็จ ลองส่งรูปใหม่ได้ไหมคะ 🙏"
-      });
-    } catch {}
-  }
-}
-
 // ---- LINE webhook (POST only). Do NOT add express.json() before this.
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
   res.status(200).end(); // ack LINE quickly
@@ -522,41 +329,90 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
   const events = Array.isArray(req.body?.events) ? req.body.events : [];
   for (const ev of events) {
     try {
-      if (ev.type !== "message") continue;
+      if (ev.type !== "message" || ev.message?.type !== "text") continue;
 
       const userId = ev?.source?.userId;
-      if (!userId) continue;
+      const text = ev?.message?.text?.trim();
+      if (!userId || !text) continue;
 
-      const mtype = ev.message?.type;
+      console.log("IN:", { userId, text });
 
-      if (mtype === "text") {
-        await handleTextMessage(ev);
-      } else if (mtype === "image") {
-        console.log("IN (image):", { userId, mid: ev.message.id });
-        await handleReceiptMessage(ev);
-      } else if (mtype === "file") {
-        // Optional: treat PDFs similarly—some vision models don't accept PDFs.
-        // For highest reliability, convert first page to JPEG server-side before sending to the model.
-        console.log("IN (file):", { userId, mid: ev.message.id, name: ev.message.fileName });
-        try {
-          // Try as image first (will fail if it's not an image)
-          await handleReceiptMessage(ev);
-        } catch {
-          try {
-            await lineClient.replyMessage(ev.replyToken, {
-              type: "text",
-              text: "ตอนนี้ระบบอ่านเฉพาะรูปสลิปได้ค่ะ หากเป็น PDF รบกวนแคปหน้าสลิปเป็นรูปภาพแล้วส่งอีกครั้งนะคะ 🙏"
-            });
-          } catch {}
+      const history = await getContext(userId);
+
+      // push into 15s silence buffer; when timer fires, reassemble to JSON then ask once
+      pushFragment(userId, text, async (frags) => {
+        const parsed = await reassembleToJSON(frags, history);
+
+        // Build a clean merged text for the assistant model
+        let mergedForAssistant = parsed.merged_text || frags.join(" / ");
+        if (parsed.items?.length) {
+          const itemsPart = parsed.items
+            .map(it => {
+              const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
+              const unit = it.unit ? ` ${it.unit}` : "";
+              return `${it.product || ""}${qty}${unit}`.trim();
+            })
+            .filter(Boolean)
+            .join(" / ");
+          mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
         }
-      } else {
+
+        // ---- NEW: deterministic listing for ฉาก / ฉากริมสังกะสี
+        const qn = norm(mergedForAssistant);
+        let repliedWithList = false;
+        const replyListFor = async (term) => {
+          const matches = listProductsByTerm(term);
+          if (!matches.length) return false;
+
+          // stable ordering
+          matches.sort((a, b) => a.name.localeCompare(b.name, "th"));
+
+          const lines = matches.map(formatPriceLine);
+          const reply = `ในร้านเรามี${term} ${matches.length} แบบนะคะ\n` + lines.join("\n");
+
+          // persist & reply
+          history.push({ role: "assistant", content: reply });
+          await setContext(userId, history);
+          try {
+            await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
+          } catch (err) {
+            console.warn("Reply failed (possibly expired token):", err?.message);
+          }
+          return true;
+        };
+
+        if (qn.includes("ฉากริมสังกะสี")) {
+          repliedWithList = await replyListFor("ฉากริมสังกะสี");
+        } else if (qn.includes("ฉาก")) {
+          repliedWithList = await replyListFor("ฉาก");
+        }
+        if (repliedWithList) return; // do not continue to LLM for this turn
+
+        // ---- fallback: normal LLM flow ----
+        let reply;
+        try {
+          reply = await askOpenRouter(mergedForAssistant, history);
+        } catch (e) {
+          console.error("OpenRouter error:", e?.message);
+          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+        }
+
+        // Persist: raw fragments, JSON summary, merged text, and assistant reply
+        for (const f of frags) history.push({ role: "user", content: f });
+        history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
+        history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
+        history.push({ role: "assistant", content: reply });
+        await setContext(userId, history);
+
         try {
           await lineClient.replyMessage(ev.replyToken, {
             type: "text",
-            text: "ตอนนี้ระบบรองรับข้อความและรูปสลิปนะคะ 🙏"
+            text: (reply || "").slice(0, 5000)
           });
-        } catch {}
-      }
+        } catch (err) {
+          console.warn("Reply failed (possibly expired token):", err?.message);
+        }
+      }, /* silenceMs */ 15000);
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
