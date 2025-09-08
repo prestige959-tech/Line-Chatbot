@@ -1,4 +1,4 @@
-// index.js (LINE version)
+// index.js (LINE version — AI-only product selection)
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -46,12 +46,14 @@ function tokens(s) {
   return m || [];
 }
 
-// ---- CSV load & product index ----
+// ---- CSV load & product index (with optional aliases/tags) ----
 let PRODUCTS = [];
-let NAME_INDEX = new Map();
+let NAME_INDEX = new Map(); // norm(name or alias) -> item (kept for future debug/tools; not used for selection)
 
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
+
+  // minimal CSV parser (keeps compatibility with your original)
   const rows = [];
   let i = 0, field = "", row = [], inQuotes = false;
   while (i < csv.length) {
@@ -71,68 +73,77 @@ async function loadProducts() {
   }
   row.push(field); rows.push(row);
 
+  if (!rows.length) {
+    console.warn("products.csv appears empty.");
+    PRODUCTS = [];
+    NAME_INDEX = new Map();
+    return;
+  }
+
   const header = rows[0].map(h => h.trim().toLowerCase());
-  const nameIdx  = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
-  const priceIdx = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
-  const unitIdx  = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h));
+  const nameIdx   = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
+  const priceIdx  = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
+  const unitIdx   = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h));
+  const aliasIdx  = header.findIndex(h => ["aliases","alias","aka","synonyms","คำพ้อง","ชื่อเรียก","อีกชื่อ"].includes(h));
+  const tagsIdx   = header.findIndex(h => ["tags","tag","หมวด","หมวดหมู่","ประเภท","คีย์เวิร์ด","keywords","keyword"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
+
+  const addIndex = (key, item) => {
+    const k = norm(key);
+    if (!k) return;
+    if (!NAME_INDEX.has(k)) NAME_INDEX.set(k, item);
+  };
+
+  const splitList = (s) => (s || "")
+    .split(/;|,|\||\/|。|、|·/g)
+    .map(x => x.trim())
+    .filter(Boolean);
+
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-    const rawName = (cols[nameIdx !== -1 ? nameIdx : 0] || "").trim();
-    const rawPrice = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
-    const rawUnit  = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim();
+    const rawName   = (cols[nameIdx  !== -1 ? nameIdx  : 0] || "").trim();
+    const rawPrice  = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
+    const rawUnit   = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim();
+    const rawAliases= aliasIdx !== -1 ? (cols[aliasIdx] || "") : "";
+    const rawTags   = tagsIdx  !== -1 ? (cols[tagsIdx]  || "") : "";
+
     if (!rawName) continue;
+
+    const aliases = splitList(rawAliases);
+    const tags    = splitList(rawTags);
+
     const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric if present
     const n = norm(rawName);
-    const kw = tokens(rawName);
+    const kw = Array.from(new Set([
+      ...tokens(rawName),
+      ...aliases.flatMap(a => tokens(a)),
+      ...tags.flatMap(t => tokens(t)),
+    ]));
+
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    const item = { name: rawName, price, unit: rawUnit, normName: n, num, keywords: kw };
+    const searchText = [rawName, ...aliases, ...tags].join(" ");
+    const item = {
+      name: rawName,
+      price,
+      unit: rawUnit,
+      normName: n,
+      num,
+      keywords: kw,
+      aliases,
+      tags,
+      searchNorm: norm(searchText)
+    };
+
     PRODUCTS.push(item);
-    if (!NAME_INDEX.has(n)) NAME_INDEX.set(n, item);
+    // index (kept for potential admin/debug commands)
+    addIndex(rawName, item);
+    for (const a of aliases) addIndex(a, item);
   }
-  console.log(`Loaded ${PRODUCTS.length} products from CSV.`);
-}
-
-function findProduct(query) {
-  const qn = norm(query);
-  const qTokens = tokens(query);
-  if (NAME_INDEX.has(qn)) return NAME_INDEX.get(qn);
-
-  const num = (query.match(/#\s*(\d+)/) || [])[1];
-  const must = qTokens.filter(t => t.length >= 2 && !/^#?\d+$/.test(t));
-  let candidates = PRODUCTS;
-
-  if (num) {
-    candidates = candidates.filter(p => p.num === num || p.name.includes(`#${num}`));
-  }
-  if (must.length) {
-    candidates = candidates.filter(p => must.every(t => norm(p.name).includes(norm(t))));
-  }
-  if (candidates.length > 1) {
-    candidates.sort((a, b) => {
-      const aScore = must.filter(t => norm(a.name).includes(norm(t))).length;
-      const bScore = must.filter(t => norm(b.name).includes(norm(t))).length;
-      if (aScore !== bScore) return bScore - aScore;
-      if (num && a.num !== b.num) return (b.num === num) - (a.num === num);
-      return a.name.length - b.name.length;
-    });
-  }
-  return candidates[0] || null;
-}
-
-// ---- Multi-match helpers for listing variants ----
-function listProductsByTerm(term) {
-  const t = norm(term);
-  return PRODUCTS.filter(p => norm(p.name).includes(t));
-}
-function formatPriceLine(p) {
-  const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : "กรุณาโทร 088-277-0145";
-  const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
-  return `• ${p.name} ราคา ${priceTxt}${unitTxt}`;
+  console.log(`Loaded ${PRODUCTS.length} products from CSV. (aliases/tags supported)`);
 }
 
 // ---- 15s silence window buffer (per user) ----
@@ -201,13 +212,6 @@ RULES
 - Keep delivery/payment/stock questions in "followups".
 - "merged_text" must be short, natural Thai, combining the fragments into a single sentence.
 - Return valid, minified JSON only. No extra whitespace.
-
-EXAMPLES (fragments → JSON)
-[1] "เอาฉาก 5 เส้น" / [2] "สีขาว"
-→ {"merged_text":"เอาฉากสีขาว 5 เส้น","items":[{"product":"ฉากสีขาว","qty":5,"unit":"เส้น"}],"followups":[]}
-
-[1] "ส่งยังไง" / [2] "คิดค่าส่งยังไงคะ"
-→ {"merged_text":"สอบถามการจัดส่งและค่าส่ง","items":[],"followups":["ส่งยังไง","คิดค่าส่งยังไงคะ"]}
 `.trim();
 
   const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
@@ -248,66 +252,53 @@ EXAMPLES (fragments → JSON)
   }
 }
 
-// ---- OpenRouter chat with product knowledge + history ----
+// ---- OpenRouter chat with sales-specialist prompt (AI-only selection) ----
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
+  // Render the catalog so the model can choose/promote products itself
   const productList = PRODUCTS.map(p => {
     const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
     const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
-    return `${p.name} = ${priceTxt}${unitTxt}`;
+    const aliasTxt = (p.aliases && p.aliases.length) ? ` | aliases: ${p.aliases.join(", ")}` : "";
+    const tagTxt   = (p.tags && p.tags.length) ? ` | tags: ${p.tags.join(", ")}` : "";
+    return `${p.name} = ${priceTxt}${unitTxt}${aliasTxt}${tagTxt}`;
   }).join("\n");
 
-const systemPrompt = `
-You are a polite, friendly Thai shop assistant. You MUST reply in Thai, naturally and concisely.
+  const systemPrompt = `
+You are a Thai **sales specialist** for a building-materials shop. ALWAYS reply in Thai, concise, friendly, and helpful (use appropriate particles: ค่ะ/ครับ/นะคะ/นะครับ).
 
-CATALOG (reference; do not guess)
+CATALOG (authoritative — use this only; do not invent prices)
+<Each line is: ชื่อสินค้า = ราคา บาท ต่อ <unit> | aliases: ... | tags: ...>
 ${productList}
 
-COMMUNICATION (must)
-- Keep answers short, clear, friendly, and polite (use appropriate Thai particles: ค่ะ/ครับ/นะคะ/นะครับ).
-- When asked for a price: show ONLY "product name, unit price", and if a quantity is given, also show the total.
-- Always include the unit exactly as in the CSV "unit" column (e.g., "ต่อ กก.", "ต่อ กล่อง").
-- If the customer mentions bundles like "มัด/แพ็ค/ชุด", IGNORE the bundle size and revert to the base unit from the CSV.
-- If the product is not found, suggest close matches from the catalog or ask a brief clarification. Never invent data.
+MATCHING (important)
+- ลูกค้าอาจใช้คำพ้อง/ชื่อเรียกทั่วไป/คำกลุ่ม (เช่น แผ่นฝ้ายิปซั่ม, ฝ้าเพดาน, แผ่นฝ้า, แผ่นผนังกั้นห้อง) ให้เทียบกับชื่อสินค้าโดยใช้ทั้งชื่อจริง, aliases และ tags จาก CATALOG
+- ถ้าคำถามกว้างหรือคลุมเครือ ให้เสนอ “ตัวเลือกที่ตรงที่สุด 1–3 รายการ” พร้อมบอกสั้น ๆ ว่าทำไมเหมาะ
+- ถ้าตรงหลายรายการ ให้แสดงแบบบูลเล็ต
+- ถ้าไม่ตรงเลย ให้เสนอรายการใกล้เคียงและถามยืนยัน 1 คำถามสั้น ๆ
 
-PRICING & QUANTITY (required)
-- We sell per piece/unit only.
-- Total = (customer quantity) × (CSV unit price).
-- If the CSV price is missing or unclear, do NOT guess. Escalate: "กรุณาโทร 088-277-0145".
+PRICING & FORMAT (strict)
+- ใช้ราคา/หน่วยตาม CATALOG เท่านั้น ห้ามเดา
+- ถ้าลูกค้าระบุจำนวน ให้คำนวณยอดรวม: จำนวน × ราคาต่อหน่วย
+- รูปแบบตอบ:
+  • เดี่ยว: "ชื่อสินค้า ราคา N บาท ต่อ <unit>" (+ “• รวม = … บาท” ถ้าระบุจำนวน)
+  • หลายตัว: ใช้บูลเล็ต "• ชื่อ ราคา N บาท ต่อ <unit>"
+- ถ้าราคาว่าง/ไม่ชัดเจน ให้แจ้ง: "กรุณาโทร 088-277-0145"
 
-WIDE CATEGORY QUERIES
-- If a generic term matches multiple products (e.g., "ฉาก", "ฉากริมสังกะสี"), list ALL matching items.
-- Use stable ordering (by name) and one line per item:
-  "• <product> ราคา <price> บาท ต่อ <unit>"
-- No extra commentary.
+SALES GUIDANCE (value add)
+- แนะนำรุ่น/ขนาด/ความหนา/อุปกรณ์เสริมที่เหมาะ (เช่น โครง, สกรู, ปูนยาแนว) ถ้าเกี่ยวข้อง
+- ถ้ามีคำถามก่อนซื้อ (พื้นที่ใช้งาน, สภาพแวดล้อม, กันชื้น/กันไฟ ฯลฯ) ให้ถามชี้นำสั้น ๆ 1 ข้อเท่านั้น
 
-ORDER SUMMARIES (when requested)
-- Show each line as "ชื่อ × จำนวน = ยอดย่อย".
-- End with "รวมทั้งสิ้น = ... บาท" (skip if any price is missing).
-
-ORDER & PAYMENT (only when asked or relevant)
-- If the customer wants to place an order, confirm succinctly.
-- Payment policy: โอนก่อนเท่านั้น.
-  Suggested wording: "ขออภัยค่ะ ทางร้านรับชำระแบบโอนก่อนเท่านั้น ไม่รับเงินสดหรือเก็บเงินปลายทางค่ะ"
-
-DELIVERY (only when asked or relevant)
-- Bangkok & vicinity: Lalamove. The shop books the driver; the customer pays shipping. No unloading team.
-
-FORMAT GUIDELINES (be concise)
-- Single price: "ชื่อสินค้า ราคา N บาท ต่อ <unit>"
-- With quantity: "ชื่อสินค้า N บาท ต่อ <unit> • รวม = (จำนวน×ราคา) บาท"
-- Multiple items: bullet list using "•" per line.
+POLICY REMINDERS (เฉพาะเมื่อเกี่ยวข้อง)
+- สั่งซื้อ: ยืนยันสั้น ๆ
+- ชำระเงิน: โอนก่อนเท่านั้น
+- จัดส่ง: กทม.และปริมณฑล Lalamove ร้านเป็นผู้เรียกรถ ลูกค้าจ่ายค่าส่งเอง
 
 DO NOT
-- Do not confirm payment/shipping/stock unless asked.
-- Do not guess price/unit/quantity.
-- Do not add excessive decoration or many emojis.
-
-AGENT NOTES
-- Use only the given CATALOG and the provided conversation history.
-- If not found, offer close matches from the CATALOG or ask a short clarifying question.
+- ห้ามยืนยันสต๊อก/การส่ง/การชำระเงินหากลูกค้าไม่ได้ถาม
+- ห้ามเดาข้อมูลนอก CATALOG
 `.trim();
 
   try {
@@ -382,38 +373,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
         }
 
-        // ---- NEW: deterministic listing for ฉาก / ฉากริมสังกะสี
-        const qn = norm(mergedForAssistant);
-        let repliedWithList = false;
-        const replyListFor = async (term) => {
-          const matches = listProductsByTerm(term);
-          if (!matches.length) return false;
-
-          // stable ordering
-          matches.sort((a, b) => a.name.localeCompare(b.name, "th"));
-
-          const lines = matches.map(formatPriceLine);
-          const reply = `ในร้านเรามี${term} ${matches.length} แบบนะคะ\n` + lines.join("\n");
-
-          // persist & reply
-          history.push({ role: "assistant", content: reply });
-          await setContext(userId, history);
-          try {
-            await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
-          } catch (err) {
-            console.warn("Reply failed (possibly expired token):", err?.message);
-          }
-          return true;
-        };
-
-        if (qn.includes("ฉากริมสังกะสี")) {
-          repliedWithList = await replyListFor("ฉากริมสังกะสี");
-        } else if (qn.includes("ฉาก")) {
-          repliedWithList = await replyListFor("ฉาก");
-        }
-        if (repliedWithList) return; // do not continue to LLM for this turn
-
-        // ---- fallback: normal LLM flow ----
+        // ---- AI-only flow: always ask the model (no code-based selection)
         let reply;
         try {
           reply = await askOpenRouter(mergedForAssistant, history);
