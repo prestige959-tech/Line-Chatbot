@@ -231,7 +231,7 @@ RULES
         temperature: 0.2,
         messages: [
           { role: "system", content: sys },
-          ...history.slice(-4),
+          ...history.slice(-20),
           { role: "user", content: user }
         ]
       })
