@@ -189,7 +189,7 @@ async function reassembleToJSON(frags, history = []) {
   if (!frags?.length) return heuristicJson([]);
 
   const sys = `
-You are a conversation normalizer for a Thai retail shop chat.
+You are a female conversation normalizer for a Thai retail shop chat.
 
 TASK
 - You receive multiple short message fragments from a customer.
