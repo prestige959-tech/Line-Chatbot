@@ -135,6 +135,60 @@ function formatPriceLine(p) {
   return `• ${p.name} ราคา ${priceTxt}${unitTxt}`;
 }
 
+// ====== NEW: Deterministic quoting & variant helpers ======
+function chooseCandidates(q) {
+  // Try strict-ish using existing findProduct
+  const exact = findProduct(q);
+  if (exact) return { best: exact, candidates: [exact], exact: true };
+
+  // First-pass: term filter
+  const cand = listProductsByTerm(q);
+  if (cand.length) return { best: cand[0], candidates: cand.slice(0, 5), exact: false };
+
+  // Token score
+  const toks = tokens(q).filter(t => t.length >= 2);
+  const scored = PRODUCTS
+    .map(p => ({ p, s: toks.reduce((n, t) => n + (norm(p.name).includes(norm(t)) ? 1 : 0), 0) }))
+    .filter(x => x.s > 0)
+    .sort((a, b) => b.s - a.s || a.p.name.length - b.p.name.length)
+    .map(x => x.p)
+    .slice(0, 5);
+  return { best: scored[0] || null, candidates: scored, exact: false };
+}
+
+function formatLineForQuote(prod, qty) {
+  const priceTxt = Number.isFinite(prod.price) ? `${prod.price} บาท` : null;
+  const unitTxt  = prod.unit ? ` ต่อ ${prod.unit}` : "";
+  if (!priceTxt) return { line: `• ${prod.name} ราคา กรุณาโทร 088-277-0145${unitTxt}`, subtotal: null };
+  const q = Number(qty) || 1;
+  const subtotal = prod.price * q;
+  return {
+    line: `• ${prod.name} ราคา ${prod.price} บาท${unitTxt} × ${q} = ${subtotal.toLocaleString("th-TH")} บาท`,
+    subtotal
+  };
+}
+
+function buildConfirmationList(title, candidates) {
+  if (!candidates?.length) return "";
+  const lines = candidates
+    .slice()
+    .sort((a,b) => a.name.localeCompare(b.name, "th"))
+    .map(formatPriceLine);
+  return `${title}\n${lines.join("\n")}`;
+}
+
+// group variants for a base family (e.g., "แผ่นฝ้ายิบซัม")
+function findVariantsByBase(term) {
+  const matches = listProductsByTerm(term);
+  matches.sort((a,b) => a.name.localeCompare(b.name, "th"));
+  return matches;
+}
+function replyVariants(term, header = "มีหลายตัวเลือกในรุ่นนี้นะคะ เลือกได้เลยค่ะ") {
+  const variants = findVariantsByBase(term);
+  if (!variants.length) return null;
+  return `${header}\n` + variants.map(formatPriceLine).join("\n");
+}
+
 // ---- 15s silence window buffer (per user) ----
 const buffers = new Map(); // userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
 
@@ -201,15 +255,7 @@ RULES
 - Keep delivery/payment/stock questions in "followups".
 - "merged_text" must be short, natural Thai, combining the fragments into a single sentence.
 - Return valid, minified JSON only. No extra whitespace.
-
-EXAMPLES (fragments → JSON)
-[1] "เอาฉาก 5 เส้น" / [2] "สีขาว"
-→ {"merged_text":"เอาฉากสีขาว 5 เส้น","items":[{"product":"ฉากสีขาว","qty":5,"unit":"เส้น"}],"followups":[]}
-
-[1] "ส่งยังไง" / [2] "คิดค่าส่งยังไงคะ"
-→ {"merged_text":"สอบถามการจัดส่งและค่าส่ง","items":[],"followups":["ส่งยังไง","คิดค่าส่งยังไงคะ"]}
 `.trim();
-
 
   const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
 
@@ -275,14 +321,12 @@ COMMUNICATION (must)
 NO-APOLOGY CLARIFICATION (important)
 - If the request doesn’t exactly match an item, DO NOT say you don’t have it and DO NOT apologize.
 - Instead, reassure and confirm by listing the closest matches and asking a yes/no question.
-- Template to use:
+- Template:
   "หมายถึงรายการนี้ใช่ไหมคะ/ครับ"
-  then a short bullet list:
+  and a short bullet list:
   • <สินค้า A> ราคา <X> บาท ต่อ <unit>
   • <สินค้า B> ราคา <Y> บาท ต่อ <unit>
-  (เลือกตอบเป็นข้อหรือระบุ #ถ้ามี)
-- If there is a single strong match, present it confidently and add a soft check:
-  "<ชื่อสินค้า> ราคา <X> บาท ต่อ <unit> — ใช่ตัวนี้ไหมคะ/ครับ?"
+  (เลือกระบุ # ถ้ามี)
 
 PRICING & QUANTITY (required)
 - We sell per piece/unit only.
@@ -290,7 +334,7 @@ PRICING & QUANTITY (required)
 - If the CSV price is missing or unclear, do NOT guess. Escalate: "กรุณาโทร 088-277-0145".
 
 WIDE CATEGORY QUERIES
-- If a generic term matches multiple products (เช่น "ฉาก", "ฉากริมสังกะสี"), list ALL matching items.
+- If a generic term matches multiple products (e.g., "ฉาก", "ฉากริมสังกะสี", "แผ่นฝ้ายิบซัม"), list ALL matching items.
 - Stable ordering (by name), one line each:
   "• <product> ราคา <price> บาท ต่อ <unit>"
 - No extra commentary.
@@ -321,7 +365,6 @@ AGENT NOTES
 - Use only the given CATALOG and the provided conversation history.
 - If not found, offer close matches from the CATALOG and ask a brief confirmation (no apologies).
 `.trim();
-
 
   try {
     const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -395,44 +438,75 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
         }
 
-        // ---- NEW: deterministic listing for ฉาก / ฉากริมสังกะสี
+        // ---- Deterministic variant lists for base terms (no LLM; no apology)
         const qn = norm(mergedForAssistant);
-        let repliedWithList = false;
-        const replyListFor = async (term) => {
-          const matches = listProductsByTerm(term);
-          if (!matches.length) return false;
+        const baseTerms = [
+          { key: "ฉากริมสังกะสี", label: "ฉากริมสังกะสี" },
+          { key: "ฉาก", label: "ฉาก" },
+          { key: "แผ่นฝ้ายิบซัม", label: "แผ่นฝ้ายิบซัม" },
+        ];
 
-          // stable ordering
-          matches.sort((a, b) => a.name.localeCompare(b.name, "th"));
-
-          const lines = matches.map(formatPriceLine);
-          const reply = `ในร้านเรามี${term} ${matches.length} แบบนะคะ\n` + lines.join("\n");
-
-          // persist & reply
-          history.push({ role: "assistant", content: reply });
-          await setContext(userId, history);
-          try {
-            await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
-          } catch (err) {
-            console.warn("Reply failed (possibly expired token):", err?.message);
+        for (const bt of baseTerms) {
+          if (qn.includes(norm(bt.key))) {
+            const reply = replyVariants(bt.label) || `กำลังตรวจสอบรายการของ ${bt.label} ค่ะ`;
+            history.push({ role: "assistant", content: reply });
+            await setContext(userId, history);
+            try {
+              await lineClient.replyMessage(ev.replyToken, { type: "text", text: reply.slice(0, 5000) });
+            } catch (err) {
+              console.warn("Reply failed (possibly expired token):", err?.message);
+            }
+            return; // do not continue to LLM or quoting this turn
           }
-          return true;
-        };
-
-        if (qn.includes("ฉากริมสังกะสี")) {
-          repliedWithList = await replyListFor("ฉากริมสังกะสี");
-        } else if (qn.includes("ฉาก")) {
-          repliedWithList = await replyListFor("ฉาก");
         }
-        if (repliedWithList) return; // do not continue to LLM for this turn
 
-        // ---- fallback: normal LLM flow ----
+        // ---- Try deterministic quoting from CSV if items are present ----
         let reply;
-        try {
-          reply = await askOpenRouter(mergedForAssistant, history);
-        } catch (e) {
-          console.error("OpenRouter error:", e?.message);
-          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+        if (parsed.items && parsed.items.length) {
+          let needsConfirm = "";
+          const lines = [];
+          let total = 0;
+
+          for (const it of parsed.items) {
+            const query = [it.product, it.unit].filter(Boolean).join(" ").trim();
+            const { best, candidates, exact } = chooseCandidates(query);
+
+            if (!best) {
+              needsConfirm += buildConfirmationList("หมายถึงรายการนี้ใช่ไหมคะ/ครับ", candidates) + "\n";
+              continue;
+            }
+
+            // If multiple similar options exist, ask to confirm instead of apologizing
+            if (!exact && candidates.length > 1) {
+              needsConfirm += buildConfirmationList("หมายถึงรายการนี้ใช่ไหมคะ/ครับ", candidates) + "\n";
+              continue;
+            }
+
+            const { line, subtotal } = formatLineForQuote(best, it.qty);
+            lines.push(line);
+            if (Number.isFinite(subtotal)) total += subtotal;
+          }
+
+          if (needsConfirm.trim()) {
+            reply = needsConfirm.trim();
+          } else if (lines.length) {
+            reply = lines.join("\n") + `\nรวมทั้งสิ้น = ${total.toLocaleString("th-TH")} บาท`;
+          }
+        }
+
+        // ---- Fallback: normal LLM flow for free-text/help ----
+        if (!reply) {
+          try {
+            reply = await askOpenRouter(mergedForAssistant, history);
+            // safety: strip any leading apology if the model added one by itself
+            reply = reply
+              .replace(/^ขออภัย[^.\n]*[.\n]?/u, "")
+              .replace(/ทางร้านไม่มีสินค้าบางรายการ[^.\n]*[.\n]?/u, "")
+              .trim();
+          } catch (e) {
+            console.error("OpenRouter error:", e?.message);
+            reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+          }
         }
 
         // Persist: raw fragments, JSON summary, merged text, and assistant reply
