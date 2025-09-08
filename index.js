@@ -1,4 +1,4 @@
-// index.js (LINE version — AI-only product selection + female Thai sales specialist)
+// index.js (LINE version — AI-only product selection + female Thai sales specialist, 20-turn memory)
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -53,7 +53,7 @@ let NAME_INDEX = new Map(); // kept for potential debug/admin — not used for s
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
 
-  // minimal CSV parser (compatible with your original)
+  // minimal CSV parser
   const rows = [];
   let i = 0, field = "", row = [], inQuotes = false;
   while (i < csv.length) {
@@ -114,7 +114,7 @@ async function loadProducts() {
     const aliases = splitList(rawAliases);
     const tags    = splitList(rawTags);
 
-    const price = Number(String(rawPrice).replace(/[^\d.]/g, "")); // numeric if present
+    const price = Number(String(rawPrice).replace(/[^\d.]/g, ""));
     const n = norm(rawName);
     const kw = Array.from(new Set([
       ...tokens(rawName),
@@ -139,7 +139,6 @@ async function loadProducts() {
     };
 
     PRODUCTS.push(item);
-    // index (debug only)
     addIndex(rawName, item);
     for (const a of aliases) addIndex(a, item);
   }
@@ -147,7 +146,7 @@ async function loadProducts() {
 }
 
 // ---- 15s silence window buffer (per user) ----
-const buffers = new Map(); // userId -> { frags: string[], timer: NodeJS.Timeout|null, firstAt: number }
+const buffers = new Map();
 
 function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60000, maxFrags = 16) {
   let buf = buffers.get(userId);
@@ -163,27 +162,20 @@ function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60
     await onReady(payload);
   };
 
-  // safety: long sessions or too many frags → process immediately
   if (buf.frags.length >= maxFrags || now - buf.firstAt >= maxWindowMs) {
     if (buf.timer) clearTimeout(buf.timer);
     buf.timer = null;
     return void fire();
   }
 
-  // reset "silence" timer every fragment
   if (buf.timer) clearTimeout(buf.timer);
   buf.timer = setTimeout(fire, silenceMs);
 }
 
 // ---- Semantic Reassembly → JSON (via OpenRouter)
-// (Keep this "sys" prompt focused on JSON only — not customer-facing)
 function heuristicJson(frags) {
   const text = frags.join(" / ").trim();
-  return {
-    merged_text: text,
-    items: [],
-    followups: [text],
-  };
+  return { merged_text: text, items: [], followups: [text] };
 }
 
 async function reassembleToJSON(frags, history = []) {
@@ -231,7 +223,7 @@ RULES
         temperature: 0.2,
         messages: [
           { role: "system", content: sys },
-          ...history.slice(-20),
+          ...history.slice(-4),
           { role: "user", content: user }
         ]
       })
@@ -253,12 +245,11 @@ RULES
   }
 }
 
-// ---- OpenRouter chat with sales-specialist prompt (AI-only selection)
+// ---- OpenRouter chat with sales-specialist prompt (20-turn memory)
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
 
-  // Render the catalog so the model can choose/promote products itself
   const productList = PRODUCTS.map(p => {
     const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
     const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
@@ -277,26 +268,26 @@ ${productList}
 
 CONTEXT (very important)
 - Answer based ONLY on the customer’s latest message.
-- Do NOT combine products or details from earlier turns unless the customer explicitly refers back (e.g., "แล้วตัวเมื่อกี้ล่ะ", "ของก่อนหน้า", "อันเดิมมีสีขาวไหม").
+- Do NOT combine products or details from earlier turns unless the customer explicitly refers back.
 - If the new message appears to be a new product/topic, treat it independently.
-- If it’s a follow-up (e.g., "มีสีอะไรบ้างคะ?", "เอากี่แผ่นดี?"), you may use relevant recent context.
+- If it’s a follow-up, you may use relevant recent context.
 
 MATCHING (aliases/tags)
-- Customers may use synonyms or generic phrases (e.g., ซีลาย, แผ่นฝ้ายิปซั่ม, ฝ้าเพดาน, แผ่นฝ้า, แผ่นผนังกั้นห้อง). Map these to catalog items using name, aliases, and tags from the catalog lines.
+- Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, and tags.
 - If multiple items fit, list the best 1–3 with a short reason why they match.
 - If nothing matches clearly, suggest the closest alternatives and ask ONE short clarifying question.
 
 PRICING & FORMAT (strict)
 - Use only the price/unit from the catalog. Never guess.
-- If quantity is given, compute: รวม = จำนวน × ราคาต่อหน่วย (show the math clearly).
+- If quantity is given, compute: รวม = จำนวน × ราคาต่อหน่วย.
 - Formatting:
   • Single item → "ชื่อสินค้า ราคา N บาท ต่อ <unit>" (+ "• รวม = … บาท" if quantity provided)
-  • Multiple items → bullet list with one line per item: "• ชื่อ ราคา N บาท ต่อ <unit>"
+  • Multiple items → bullet list: "• ชื่อ ราคา N บาท ต่อ <unit>"
 - If any price is missing/unclear → say: "กรุณาโทร 088-277-0145 นะคะ"
 
-SALES SPECIALIST BEHAVIOR (value add)
-- Ask at most ONE guiding question when it helps select the right product (e.g., พื้นที่ใช้งาน, ภายใน/ภายนอก, ห้องน้ำ/ห้องครัว, กันชื้น/กันไฟ).
-- Offer 1–2 relevant upsell/cross-sell suggestions (e.g., โครง, สกรู, ปูนยาแนว, อุปกรณ์ติดตั้ง) only if they’re clearly helpful.
+SALES SPECIALIST BEHAVIOR
+- Ask at most ONE guiding question when it helps select the right product.
+- Offer 1–2 relevant upsell/cross-sell suggestions only if they’re clearly helpful.
 - Keep answers short and easy to scan.
 
 POLICIES (only when asked or relevant)
@@ -306,7 +297,7 @@ POLICIES (only when asked or relevant)
 
 TONE & EMPATHY
 - Be warm and respectful; greet at the start of a new conversation and close politely when appropriate.
-- If the customer shows concern (e.g., "แพงจัง"), acknowledge politely before providing options.
+- If the customer shows concern, acknowledge politely before providing options.
 
 DO NOT
 - Do not claim stock status, shipping time, or payment confirmation unless asked.
@@ -315,7 +306,7 @@ DO NOT
 
 OUTPUT QUALITY
 - Keep it concise, clear, and helpful.
-- Prioritize correctness and readability over verbosity.
+- Prioritize correctness and readability.
 `.trim();
 
   try {
@@ -333,8 +324,7 @@ OUTPUT QUALITY
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          // Keep conversation, but cap to recent context to avoid mixing old topics
-          ...history.slice(-6),
+          ...history.slice(-20),   // <-- keep last 20 turns
           { role: "user", content: userText }
         ]
       })
@@ -356,9 +346,9 @@ OUTPUT QUALITY
   }
 }
 
-// ---- LINE webhook (POST only). Do NOT add express.json() before this.
+// ---- LINE webhook
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
-  res.status(200).end(); // ack LINE quickly
+  res.status(200).end();
 
   const events = Array.isArray(req.body?.events) ? req.body.events : [];
   for (const ev of events) {
@@ -373,11 +363,9 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       const history = await getContext(userId);
 
-      // push into 15s silence buffer; when timer fires, reassemble to JSON then ask once
       pushFragment(userId, text, async (frags) => {
         const parsed = await reassembleToJSON(frags, history);
 
-        // Build a clean merged text for the assistant model
         let mergedForAssistant = parsed.merged_text || frags.join(" / ");
         if (parsed.items?.length) {
           const itemsPart = parsed.items
@@ -391,7 +379,6 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
         }
 
-        // ---- AI-only flow: always ask the model (no code-based selection)
         let reply;
         try {
           reply = await askOpenRouter(mergedForAssistant, history);
@@ -400,7 +387,6 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
         }
 
-        // Persist: raw fragments, JSON summary, merged text, and assistant reply
         for (const f of frags) history.push({ role: "user", content: f });
         history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
         history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
@@ -415,7 +401,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
         } catch (err) {
           console.warn("Reply failed (possibly expired token):", err?.message);
         }
-      }, /* silenceMs */ 15000);
+      }, 15000);
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
