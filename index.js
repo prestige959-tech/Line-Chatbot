@@ -38,7 +38,7 @@ function norm(s) {
     .toLowerCase()
     .normalize("NFKC")
     .replace(/[ \t\r\n]/g, "")
-    .replace(/[.,;:!?'""“”‘’(){}\[\]<>|/\\\-_=+]/g, "");
+    .replace(/[.,;:!?'""“”‘’(){}\[\]<>|\\/\\\-_=+]/g, "");
 }
 function tokens(s) {
   const t = (s || "").toLowerCase();
@@ -46,7 +46,7 @@ function tokens(s) {
   return m || [];
 }
 
-// ---- CSV load & product index (with optional aliases/tags) ----
+// ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
 let PRODUCTS = [];
 let NAME_INDEX = new Map(); // kept for potential debug/admin — not used for selection
 
@@ -81,11 +81,13 @@ async function loadProducts() {
   }
 
   const header = rows[0].map(h => h.trim().toLowerCase());
-  const nameIdx   = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
-  const priceIdx  = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
-  const unitIdx   = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h));
-  const aliasIdx  = header.findIndex(h => ["aliases","alias","aka","synonyms","คำพ้อง","ชื่อเรียก","อีกชื่อ"].includes(h));
-  const tagsIdx   = header.findIndex(h => ["tags","tag","หมวด","หมวดหมู่","ประเภท","คีย์เวิร์ด","keywords","keyword"].includes(h));
+  const nameIdx    = header.findIndex(h => ["name","product","title","สินค้า","รายการ","product_name"].includes(h));
+  const priceIdx   = header.findIndex(h => ["price","ราคา","amount","cost"].includes(h));
+  const unitIdx    = header.findIndex(h => ["unit","หน่วย","ยูนิต"].includes(h));
+  const aliasIdx   = header.findIndex(h => ["aliases","alias","aka","synonyms","คำพ้อง","ชื่อเรียก","อีกชื่อ"].includes(h));
+  const tagsIdx    = header.findIndex(h => ["tags","tag","หมวด","หมวดหมู่","ประเภท","คีย์เวิร์ด","keywords","keyword"].includes(h));
+  const specIdx    = header.findIndex(h => ["specification","specifications","dimension","dimensions","ขนาด","สเปค","รายละเอียด"].includes(h));
+  const bundleIdx  = header.findIndex(h => ["pcs_per_bundle","pieces_per_bundle","pieces/bundle","pcs/bundle","bundle_pcs","จำนวนต่อมัด","ชิ้นต่อมัด","แผ่นต่อมัด","แท่งต่อมัด","ชิ้น/มัด","ต่อมัด"].includes(h));
 
   PRODUCTS = [];
   NAME_INDEX = new Map();
@@ -103,11 +105,13 @@ async function loadProducts() {
 
   for (let r = 1; r < rows.length; r++) {
     const cols = rows[r];
-    const rawName   = (cols[nameIdx  !== -1 ? nameIdx  : 0] || "").trim();
-    const rawPrice  = (cols[priceIdx !== -1 ? priceIdx : 1] || "").trim();
-    const rawUnit   = (cols[unitIdx  !== -1 ? unitIdx  : 2] || "").trim();
-    const rawAliases= aliasIdx !== -1 ? (cols[aliasIdx] || "") : "";
-    const rawTags   = tagsIdx  !== -1 ? (cols[tagsIdx]  || "") : "";
+    const rawName     = (cols[nameIdx   !== -1 ? nameIdx   : 0] || "").trim();
+    const rawPrice    = (cols[priceIdx  !== -1 ? priceIdx  : 1] || "").trim();
+    const rawUnit     = (cols[unitIdx   !== -1 ? unitIdx   : 2] || "").trim();
+    const rawAliases  = aliasIdx  !== -1 ? (cols[aliasIdx]  || "") : "";
+    const rawTags     = tagsIdx   !== -1 ? (cols[tagsIdx]   || "") : "";
+    const rawSpec     = specIdx   !== -1 ? (cols[specIdx]   || "").trim() : "";
+    const rawBundle   = bundleIdx !== -1 ? (cols[bundleIdx] || "").trim() : "";
 
     if (!rawName) continue;
 
@@ -120,12 +124,20 @@ async function loadProducts() {
       ...tokens(rawName),
       ...aliases.flatMap(a => tokens(a)),
       ...tags.flatMap(t => tokens(t)),
+      ...tokens(rawSpec),
+      ...tokens(rawBundle),
     ]));
 
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
-    const searchText = [rawName, ...aliases, ...tags].join(" ");
+    // parse bundle into number if possible
+    const piecesPerBundle = (() => {
+      const v = Number(String(rawBundle).replace(/[^\d.]/g, ""));
+      return Number.isFinite(v) && v > 0 ? v : null;
+    })();
+
+    const searchText = [rawName, ...aliases, ...tags, rawSpec, rawBundle].join(" ");
     const item = {
       name: rawName,
       price,
@@ -135,14 +147,17 @@ async function loadProducts() {
       keywords: kw,
       aliases,
       tags,
-      searchNorm: norm(searchText)
+      searchNorm: norm(searchText),
+      specification: rawSpec || null,
+      pcsPerBundle: piecesPerBundle,   // numeric if parsed, else null
+      bundleRaw: rawBundle || null
     };
 
     PRODUCTS.push(item);
     addIndex(rawName, item);
     for (const a of aliases) addIndex(a, item);
   }
-  console.log(`Loaded ${PRODUCTS.length} products from CSV. (aliases/tags supported)`);
+  console.log(`Loaded ${PRODUCTS.length} products from CSV. (aliases/tags/specs supported)`);
 }
 
 // ---- 15s silence window buffer (per user) ----
@@ -255,7 +270,9 @@ async function askOpenRouter(userText, history = []) {
     const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
     const aliasTxt = (p.aliases && p.aliases.length) ? ` | aliases: ${p.aliases.join(", ")}` : "";
     const tagTxt   = (p.tags && p.tags.length) ? ` | tags: ${p.tags.join(", ")}` : "";
-    return `${p.name} = ${priceTxt}${unitTxt}${aliasTxt}${tagTxt}`;
+    const specTxt  = p.specification ? ` | ขนาด: ${p.specification}` : "";
+    const bundleTxt= (p.pcsPerBundle ? ` | pcs_per_bundle: ${p.pcsPerBundle}` : (p.bundleRaw ? ` | pcs_per_bundle: ${p.bundleRaw}` : ""));
+    return `${p.name} = ${priceTxt}${unitTxt}${aliasTxt}${tagTxt}${specTxt}${bundleTxt}`;
   }).join("\n");
 
   const systemPrompt = `
@@ -263,16 +280,17 @@ You are a Thai sales specialist for a building-materials shop.
 Always reply in Thai, concise, friendly, and in a female, polite tone (use ค่ะ / นะคะ naturally). Use emojis sparingly (0–1 when it helps).
 
 CATALOG (authoritative — use this only; do not invent prices)
-<Each line is: product name = price Baht per unit | aliases: ... | tags: ... | specification: ... | pcs_per_bundle: ...>
+<Each line is: product name = price Baht per unit | aliases: ... | tags: ... | ขนาด: ... | pcs_per_bundle: ...>
+${productList}
 
 CONTEXT (very important)
 - Answer based ONLY on the customer’s latest message.
 - Do NOT combine products or details from earlier turns unless the customer explicitly refers back.
 - If the new message appears to be a new product/topic, treat it independently.
-- If it’s a follow-up, you may use relevant recent context.
+- If it is a follow-up, you may use relevant recent context.
 
 MATCHING (aliases/tags)
-- Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and specifications.
+- Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and ขนาด.
 - If multiple items fit, list the best 1–3 with a short reason why they match.
 - If nothing matches clearly, suggest the closest alternatives and ask ONE short clarifying question.
 
@@ -290,19 +308,21 @@ BUNDLE Q&A
   • If multiple products are possible, ask ONE short clarifying question first.
   • If pcs_per_bundle is missing, politely say the information is not available and suggest calling 088-277-0145.
 
-
 SPECIFICATION HANDLING
-- Do NOT mention or guess product specifications unless the customer explicitly asks about size, dimensions, thickness, width, length, or uses the word "ขนาด/สเปค".
-- If the customer asks about specifications, use ONLY the "specification" field from the catalog.
-- When replying, do not show the word "specification". Instead, present the value naturally prefixed with "ขนาด".
-- Example: say "ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm" (not "specification: ...").
+- Do NOT mention or guess size unless the customer explicitly asks about "ขนาด/สเปค" or dimensions.
+- If asked, use ONLY the "ขนาด" field (from specification in the catalog).
+- When replying, do not use the English word "specification". Instead, present the value naturally prefixed with "ขนาด".
+- Example: say "ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm".
 - If multiple products could match, ask ONE short clarifying question.
-- If the specification field is missing, politely say the information is not available and suggest calling 088-277-0145.
+- If no ขนาด data, politely say it is not available and suggest calling 088-277-0145.
 
+GENERAL LISTING
+- If the customer asks about a general product group (e.g., "ซีลาย ราคาเท่าไหร่"), list the matching catalog options with their prices and units.
+- Format as a simple bullet list for easy reading.
 
 SALES SPECIALIST BEHAVIOR
 - Ask at most ONE guiding question when it helps select the right product.
-- Offer 1–2 relevant upsell/cross-sell suggestions only if they’re clearly helpful.
+- Offer 1–2 relevant upsell/cross-sell suggestions only if they are clearly helpful.
 - Keep answers short and easy to scan.
 
 POLICIES (only when asked or relevant)
@@ -324,12 +344,16 @@ OUTPUT QUALITY
 - Prioritize correctness and readability.
 
 Examples:
-Customer: 1 มัดมีกี่เส้นคะ  
-Assistant: 10 เส้นค่ะ  
+Customer: 1 มัดมีกี่เส้นคะ
+Assistant: 10 เส้นค่ะ
 
-Customer: ขนาดซีลาย ราคา 20 บาท ใช่ 3.6x400x1.4 ซม.หรือป่าวคะ  
-Assistant: ซีลาย ราคา 20 บาท ต่อ เส้นค่ะ • specification: กว้าง 36 mm x 11 mm x 4000 mm หนา 0.32-0.35 mm
+Customer: ขนาดซีลาย ราคา 20 บาท ใช่ 3.6x400x1.4 ซม.หรือป่าวคะ
+Assistant: ซีลาย # 26 เต็ม 6.0-6.5 กก./มัด ราคา 20 บาท ต่อ เส้นค่ะ • ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm
 
+Customer: ซีลาย ราคาเท่าไหร่
+Assistant:
+• ซีลาย # 26 เบา 5.6-5.9 กก./มัด ราคา 19 บาท ต่อ เส้นค่ะ
+• ซีลาย # 26 เต็ม 6.0-6.5 กก./มัด ราคา 20 บาท ต่อ เส้นค่ะ
 `.trim();
 
   try {
