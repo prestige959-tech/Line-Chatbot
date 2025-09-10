@@ -38,7 +38,7 @@ function norm(s) {
     .toLowerCase()
     .normalize("NFKC")
     .replace(/[ \t\r\n]/g, "")
-    .replace(/[.,;:!?'""“”‘’(){}\[\]<>|\\/\\\-_=+]/g, "");
+    .replace(/[.,;:!?'""“”‘’(){}\[\]<>|/\\\\\\\\-_=+]/g, "");
 }
 function tokens(s) {
   const t = (s || "").toLowerCase();
@@ -149,7 +149,7 @@ async function loadProducts() {
       tags,
       searchNorm: norm(searchText),
       specification: rawSpec || null,
-      pcsPerBundle: piecesPerBundle,   // numeric if parsed, else null
+      pcsPerBundle: piecesPerBundle,
       bundleRaw: rawBundle || null
     };
 
@@ -260,6 +260,34 @@ RULES
   }
 }
 
+// --- One-turn intent memory per user (size/bundle), cancelled on topic switch
+const pendingIntent = new Map(); // userId -> { spec:boolean, bundle:boolean, group:string, ts:number }
+
+function baseTokens(s) { return tokens(s).map(t => norm(t)); }
+function detectProductGroup(query) {
+  const qn = norm(query || "");
+  const qTokens = new Set(baseTokens(query || ""));
+  let best = null;
+  for (const p of PRODUCTS) {
+    const nameHit = p.searchNorm?.includes(qn);
+    const kwHit = p.keywords?.some(k => qTokens.has(norm(k)));
+    if (nameHit || kwHit) {
+      const head = (p.name.match(/[A-Za-zก-๙#]+/g) || [p.name])[0];
+      const group = head ? head.toLowerCase() : p.name.toLowerCase();
+      best = group;
+      break;
+    }
+  }
+  return best;
+}
+const SPEC_RE   = /ขนาด|สเปค|สเป็ค|กว้าง|ยาว|หนา/i;
+const BUNDLE_RE = /(มัด).*กี่|กี่เส้น|กี่แผ่น|กี่ท่อน/i;
+function looksLikeProductOnly(msg) {
+  const m = (msg || "").toLowerCase();
+  if (SPEC_RE.test(m) || BUNDLE_RE.test(m)) return false;
+  return baseTokens(m).length > 0;
+}
+
 // ---- OpenRouter chat with sales-specialist prompt (20-turn memory)
 async function askOpenRouter(userText, history = []) {
   const controller = new AbortController();
@@ -285,9 +313,9 @@ ${productList}
 
 CONTEXT (very important)
 - Answer based ONLY on the customer’s latest message.
-- Do NOT combine products or details from earlier turns unless the customer explicitly refers back.
-- If the new message appears to be a new product/topic, treat it independently.
-- If it is a follow-up, you may use relevant recent context.
+- However, if the previous customer turn explicitly asked about size/spec ("ขนาด/สเปค", กว้าง/ยาว/หนา) or bundle size ("1 มัดมีกี่…"), and you asked a clarifying question (e.g., which model), then treat the user’s next reply that contains only a product name/variant as a continuation of that intent:
+  • For size/spec continuation → include ขนาด from the catalog.
+  • For bundle-size continuation → answer with pcs_per_bundle + correct unit.
 
 MATCHING (aliases/tags)
 - Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and ขนาด.
@@ -347,7 +375,7 @@ Examples:
 Customer: 1 มัดมีกี่เส้นคะ
 Assistant: 10 เส้นค่ะ
 
-Customer: ขนาดซีลาย ราคา 20 บาท ใช่ 3.6x400x1.4 ซม.หรือป่าวคะ
+Customer: ขนาดซีลาย 26 เต็ม
 Assistant: ซีลาย # 26 เต็ม 6.0-6.5 กก./มัด ราคา 20 บาท ต่อ เส้นค่ะ • ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm
 
 Customer: ซีลาย ราคาเท่าไหร่
@@ -424,6 +452,31 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
             .filter(Boolean)
             .join(" / ");
           mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
+        }
+
+        // ---------- One-turn size/bundle intent carry with topic switch guard ----------
+        const lastUserMsg = (frags[frags.length - 1] || "");
+        const lastGroup   = detectProductGroup(lastUserMsg);
+        const askedSpecNow   = SPEC_RE.test(lastUserMsg);
+        const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
+
+        if (askedSpecNow || askedBundleNow) {
+          pendingIntent.set(userId, {
+            spec: askedSpecNow,
+            bundle: askedBundleNow,
+            group: lastGroup || detectProductGroup(mergedForAssistant) || null,
+            ts: Date.now()
+          });
+        } else {
+          const intent = pendingIntent.get(userId);
+          if (intent) {
+            const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
+            if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
+              if (intent.spec)   mergedForAssistant = `${mergedForAssistant} / ขอขนาด`;
+              if (intent.bundle) mergedForAssistant = `${mergedForAssistant} / 1 มัดมีกี่หน่วย`;
+            }
+            pendingIntent.delete(userId);
+          }
         }
 
         let reply;
