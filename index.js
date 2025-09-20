@@ -326,6 +326,7 @@ COMPANY INFO
 
 MATCHING (aliases/tags)
 - Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and ขนาด.
+- The word "โครงซีลาย" should always be interpreted as "ซีลาย".
 - If multiple items fit, list the best 1–3 with a short reason why they match.
 - If nothing matches clearly, suggest the closest alternatives and ask ONE short clarifying question.
 
