@@ -1,4 +1,4 @@
-// index.js — LINE bot with single OpenRouter call per batch, env-wired batching, 429 backoff, and simple concurrency limiter
+// index.js — LINE bot with human-intervene (silence) mode
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -21,6 +21,9 @@ const MAX_FRAGS = Number(process.env.MAX_FRAGS || 16);
 const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000);
 const OPENROUTER_MAX_CONCURRENCY = Number(process.env.OPENROUTER_MAX_CONCURRENCY || 2);
 const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 25000);
+
+// Silence window for human-takeover (minutes)
+const HUMAN_SILENCE_MINUTES = Number(process.env.HUMAN_SILENCE_MINUTES || 60);
 
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
@@ -51,12 +54,81 @@ function norm(s) {
     .toLowerCase()
     .normalize("NFKC")
     .replace(/[ \t\r\n]/g, "")
-    .replace(/[.,;:!?'"“”‘’(){}\[\]<>|/\\\\\-_=+]/g, "");
+    .replace(/[.,;:!?'"“”‘’(){}\[\]<>|/\\\-_=+]/g, "");
 }
 function tokens(s) {
   const t = (s || "").toLowerCase();
   const m = t.match(/[#]?\d+|[a-zA-Zก-๙]+/g);
   return m || [];
+}
+
+// ---- Human-intervene: silence mode (per-user flag) ----
+const humanLive = new Map(); // userId → until timestamp (ms)
+
+function setHumanLive(userId, minutes = HUMAN_SILENCE_MINUTES) {
+  const until = Date.now() + minutes * 60 * 1000;
+  humanLive.set(userId, until);
+}
+function isHumanLive(userId) {
+  const until = humanLive.get(userId);
+  if (!until) return false;
+  if (Date.now() > until) {
+    humanLive.delete(userId); // expired
+    return false;
+    }
+  return true;
+}
+function clearHumanLive(userId) {
+  humanLive.delete(userId);
+}
+
+// Staff triggers that all behave the same (pause bot)
+const STAFF_SILENCE_TRIGGERS = [
+  "/admin",
+  "/takeover",
+  "ส่งต่อให้เจ้าหน้าที่",
+  "ส่งต่อให้เจ้าหน้าที่ค่ะ",
+  "ส่งต่อให้เจ้าหน้าที่นะคะ"
+];
+function isSilenceTrigger(txt) {
+  const n = norm(txt);
+  return STAFF_SILENCE_TRIGGERS.some(p => n.includes(norm(p)));
+}
+
+// Optional: restrict triggers to known staff LINE IDs (leave empty to allow anyone)
+const STAFF_IDS = new Set(
+  (process.env.STAFF_IDS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+function isStaff(ev) {
+  if (STAFF_IDS.size === 0) return true; // no restriction configured
+  const uid = ev?.source?.userId || "";
+  return STAFF_IDS.has(uid);
+}
+
+// Messages we ourselves might send back (avoid re-trigger loops if ever echoed)
+const BOT_MESSAGES = new Set([
+  "ตอนนี้เจ้าหน้าที่จะช่วยตอบกลับเองค่ะ 🙏",
+  "ส่งต่อเจ้าหน้าที่แล้วค่ะ เดี๋ยวตอบกลับใน LINE นี้นะคะ 🙏",
+  "ขออนุญาตส่งต่อเจ้าหน้าที่เพื่อช่วยเพิ่มเติมนะคะ 🙏"
+]);
+function isBotMessageEcho(text) {
+  return BOT_MESSAGES.has((text || "").trim());
+}
+
+// Safe reply with push fallback (handles expired replyToken)
+async function safeReply(replyToken, userId, text) {
+  try {
+    await lineClient.replyMessage(replyToken, { type: "text", text: (text || "").slice(0, 5000) });
+  } catch (err) {
+    try {
+      await lineClient.pushMessage(userId, { type: "text", text: (text || "").slice(0, 5000) });
+    } catch (e2) {
+      console.error("Push failed:", e2?.message);
+    }
+  }
 }
 
 // ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
@@ -383,7 +455,6 @@ async function answerOnceWithLLM(frags, history = []) {
   const systemPrompt = buildSystemPrompt(productList);
   const user = frags.map((f, i) => `[${i+1}] ${f}`).join("\n");
 
-
   let lastErr;
   for (const model of MODELS) {
     try {
@@ -405,16 +476,13 @@ async function answerOnceWithLLM(frags, history = []) {
       return content.trim();
     } catch (e) {
       const msg = String(e?.message || "");
-      // if 429/rate-limited upstream, try next model immediately
       if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429")) {
-        lastErr = e;
+        lastErr = e; // try next model
         continue;
       }
-      // otherwise, bubble up the error
       throw e;
     }
   }
-  // All models failed
   throw lastErr || new Error("All models failed");
 }
 
@@ -428,62 +496,97 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       if (ev.type !== "message" || ev.message?.type !== "text") continue;
 
       const userId = ev?.source?.userId;
-      const text = ev?.message?.text?.trim();
+      const text = (ev?.message?.text || "").trim();
       if (!userId || !text) continue;
+
+      // Ignore pure echoes of bot messages (defensive)
+      if (isBotMessageEcho(text)) continue;
+
+      // --- Staff triggers to pause OR resume (handled before any AI work) ---
+      if (isSilenceTrigger(text) && isStaff(ev)) {
+        setHumanLive(userId, HUMAN_SILENCE_MINUTES);
+        await safeReply(ev.replyToken, userId, "ตอนนี้เจ้าหน้าที่จะช่วยตอบกลับเองค่ะ 🙏");
+        continue;
+      }
+      if (norm(text) === norm("/resume") && isStaff(ev)) {
+        clearHumanLive(userId);
+        await safeReply(ev.replyToken, userId, "กลับเป็นโหมดบอทแล้วค่ะ ✅");
+        continue;
+      }
+
+      // If user is currently in human-live (silence) → bot stays silent
+      if (isHumanLive(userId)) {
+        // Optionally extend window on user ping:
+        setHumanLive(userId, HUMAN_SILENCE_MINUTES);
+        continue;
+      }
 
       console.log("IN:", { userId, text });
 
       const history = await getContext(userId);
 
-      pushFragment(userId, text, async (frags) => {
-        // ---------- One-turn size/bundle intent carry with topic switch guard ----------
-        const lastUserMsg = (frags[frags.length - 1] || "");
-        const lastGroup   = detectProductGroup(lastUserMsg);
-        const askedSpecNow   = SPEC_RE.test(lastUserMsg);
-        const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
+      pushFragment(
+        userId,
+        text,
+        async (frags) => {
+          // ---------- One-turn size/bundle intent carry with topic switch guard ----------
+          const lastUserMsg = (frags[frags.length - 1] || "");
+          const lastGroup   = detectProductGroup(lastUserMsg);
+          const askedSpecNow   = SPEC_RE.test(lastUserMsg);
+          const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
 
-        // persist intent when explicitly asked now
-        if (askedSpecNow || askedBundleNow) {
-          pendingIntent.set(userId, {
-            spec: askedSpecNow,
-            bundle: askedBundleNow,
-            group: lastGroup || null,
-            ts: Date.now()
-          });
-        } else {
-          const intent = pendingIntent.get(userId);
-          if (intent) {
-            const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
-            if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
-              // append a virtual line that hints the continuation to the model
-              if (intent.spec)   frags.push("ขอขนาด");
-              if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
+          // persist intent when explicitly asked now
+          if (askedSpecNow || askedBundleNow) {
+            pendingIntent.set(userId, {
+              spec: askedSpecNow,
+              bundle: askedBundleNow,
+              group: lastGroup || null,
+              ts: Date.now()
+            });
+          } else {
+            const intent = pendingIntent.get(userId);
+            if (intent) {
+              const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
+              if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
+                // append a virtual line that hints the continuation to the model
+                if (intent.spec)   frags.push("ขอขนาด");
+                if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
+              }
+              pendingIntent.delete(userId);
             }
-            pendingIntent.delete(userId);
           }
-        }
 
-        let reply;
-        try {
-          reply = await answerOnceWithLLM(frags, history);
-        } catch (e) {
-          console.error("OpenRouter error:", e?.message);
-          reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
-        }
+          let reply;
+          try {
+            reply = await answerOnceWithLLM(frags, history);
+          } catch (e) {
+            console.error("OpenRouter error:", e?.message);
+            reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
+          }
 
-        for (const f of frags) history.push({ role: "user", content: f });
-        history.push({ role: "assistant", content: reply });
-        await setContext(userId, history);
+          for (const f of frags) history.push({ role: "user", content: f });
+          history.push({ role: "assistant", content: reply });
+          await setContext(userId, history);
 
-        try {
-          await lineClient.replyMessage(ev.replyToken, {
-            type: "text",
-            text: (reply || "").slice(0, 5000)
-          });
-        } catch (err) {
-          console.warn("Reply failed (possibly expired token):", err?.message);
-        }
-      }, SILENCE_MS, MAX_WINDOW_MS, MAX_FRAGS);
+          try {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: (reply || "").slice(0, 5000)
+            });
+          } catch (err) {
+            console.warn("Reply failed (possibly expired token):", err?.message);
+            // fallback
+            try {
+              await lineClient.pushMessage(userId, { type: "text", text: (reply || "").slice(0, 5000) });
+            } catch (e2) {
+              console.error("Push failed:", e2?.message);
+            }
+          }
+        },
+        SILENCE_MS,
+        MAX_WINDOW_MS,
+        MAX_FRAGS
+      );
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
