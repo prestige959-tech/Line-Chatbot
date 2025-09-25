@@ -5,6 +5,8 @@ import { readFile } from "fs/promises";
 import { getContext, setContext } from "./chatMemory.js";
 
 const app = express();
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "super-secret";
+const humanLive = new Map(); // userId -> until timestamp
 
 // ---- ENV ----
 const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
@@ -522,6 +524,12 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       }
 
       console.log("IN:", { userId, text });
+      // --- Human takeover guard ---
+      const until = humanLive.get(userId);
+      if (until && until > Date.now()) {
+        console.log("Silenced user:", userId);
+        continue; // skip bot reply
+      }
 
       const history = await getContext(userId);
 
@@ -602,4 +610,28 @@ app.listen(PORT, async () => {
     console.error("Failed to load products.csv:", err?.message);
   });
   console.log("Bot running on port", PORT);
+});
+app.post("/admin/takeover", express.json(), (req, res) => {
+  const token = req.headers["x-admin-token"];
+  if (token !== ADMIN_TOKEN) return res.status(403).json({ ok: false, error: "Forbidden" });
+
+  const { userId, minutes = 60 } = req.body;
+  if (!userId) return res.status(400).json({ ok: false, error: "Missing userId" });
+
+  const until = Date.now() + minutes * 60000;
+  humanLive.set(userId, until);
+  console.log("Takeover:", userId, "until", new Date(until).toISOString());
+  res.json({ ok: true, until });
+});
+
+app.post("/admin/resume", express.json(), (req, res) => {
+  const token = req.headers["x-admin-token"];
+  if (token !== ADMIN_TOKEN) return res.status(403).json({ ok: false, error: "Forbidden" });
+
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ ok: false, error: "Missing userId" });
+
+  humanLive.delete(userId);
+  console.log("Resume:", userId);
+  res.json({ ok: true });
 });
