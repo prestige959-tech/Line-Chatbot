@@ -69,9 +69,53 @@ app.post("/admin/resume", express.json(), (req, res) => {
 
 // ============================================================================
 // CSV product loading
-// (same as your existing code … no changes needed here)
 // ============================================================================
-// ... keep your loadProducts(), detectProductGroup(), buildSystemPrompt(), etc.
+let products = [];
+
+async function loadProducts() {
+  try {
+    const csvData = await readFile("products.csv", "utf-8");
+    const lines = csvData.split("\n").map(line => line.trim()).filter(Boolean);
+
+    products = [];
+    for (let i = 1; i < lines.length; i++) { // Skip header
+      const cols = lines[i].split(",").map(s => s.trim());
+      if (cols.length >= 3) {
+        products.push({
+          name: cols[0] || "",
+          price: cols[1] || "",
+          description: cols[2] || ""
+        });
+      }
+    }
+    console.log(`Loaded ${products.length} products from CSV`);
+  } catch (err) {
+    console.error("Error loading products.csv:", err.message);
+  }
+}
+
+function detectProductGroup(text) {
+  // Simple keyword matching for product detection
+  const lowerText = text.toLowerCase();
+  const matches = products.filter(p =>
+    lowerText.includes(p.name.toLowerCase()) ||
+    lowerText.includes(p.description.toLowerCase())
+  );
+  return matches;
+}
+
+function buildSystemPrompt() {
+  const productList = products.slice(0, 20).map(p =>
+    `- ${p.name}: ${p.price} (${p.description})`
+  ).join("\n");
+
+  return `คุณเป็นผู้ช่วยขายสินค้าที่เป็นมิตรและมีประสิทธิภาพ
+
+สินค้าที่มี:
+${productList}
+
+ตอบคำถามด้วยความเป็นมิตร ให้ข้อมูลที่ถูกต้อง และช่วยลูกค้าเลือกสินค้าที่เหมาะสม`;
+}
 
 // ============================================================================
 // LINE Webhook
