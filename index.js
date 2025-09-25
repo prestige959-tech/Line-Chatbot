@@ -1,4 +1,6 @@
-// index.js — LINE bot with OpenRouter + human takeover (silence mode) + admin endpoints + user profile cache
+// index.js — LINE bot with single OpenRouter call per batch, env-wired batching, 429 backoff,
+// simple concurrency limiter, AND human-takeover silence mode with Railway admin endpoints.
+
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -22,8 +24,9 @@ const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000);
 const OPENROUTER_MAX_CONCURRENCY = Number(process.env.OPENROUTER_MAX_CONCURRENCY || 2);
 const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 25000);
 
-// Admin & silence
+// NEW: Admin token for Railway control endpoints
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
+// How long to silence when taking over (minutes) — override per request body if needed
 const HUMAN_SILENCE_MINUTES = Number(process.env.HUMAN_SILENCE_MINUTES || 60);
 
 const mask = s =>
@@ -65,8 +68,9 @@ function tokens(s) {
 }
 
 // ============================================================================
-// Human-takeover (silence mode) — per-user flag + Railway admin endpoints
+// NEW: Human-takeover (silence mode) — per-user flag + Railway admin endpoints
 // ============================================================================
+
 /** userId -> silence-until timestamp (ms) */
 const humanLive = new Map();
 
@@ -85,99 +89,12 @@ function isHumanLive(userId) {
   return true;
 }
 
+// Protected admin endpoints — call from PC/phone (Postman/Shortcuts) to silence/resume
 function isAdmin(req) {
   const token = (req.headers["x-admin-token"] || "").toString().trim();
   return !!ADMIN_TOKEN && token === ADMIN_TOKEN;
 }
 
-// ============================================================================
-// User profile cache + recent users list (for human-friendly admin view)
-// ============================================================================
-/** userId -> { displayName, pictureUrl, lastSeenAt } */
-const userProfiles = new Map();
-/** recent userId ring buffer for admin listing */
-const recentUsers = [];
-const RECENT_MAX = 200;
-
-async function ensureProfile(ev, lineClient) {
-  const src = ev.source || {};
-  const userId = src.userId;
-  if (!userId) return;
-
-  const existing = userProfiles.get(userId);
-  if (!existing) {
-    try {
-      let profile;
-      if (src.type === "group" && src.groupId) {
-        profile = await lineClient.getGroupMemberProfile(src.groupId, userId);
-      } else if (src.type === "room" && src.roomId) {
-        profile = await lineClient.getRoomMemberProfile(src.roomId, userId);
-      } else {
-        profile = await lineClient.getProfile(userId); // 1:1 chat
-      }
-      userProfiles.set(userId, {
-        displayName: profile?.displayName || "Unknown",
-        pictureUrl: profile?.pictureUrl || null,
-        lastSeenAt: Date.now()
-      });
-    } catch (e) {
-      userProfiles.set(userId, {
-        displayName: "Unknown",
-        pictureUrl: null,
-        lastSeenAt: Date.now()
-      });
-    }
-  } else {
-    existing.lastSeenAt = Date.now();
-  }
-
-  if (recentUsers[recentUsers.length - 1] !== userId) {
-    recentUsers.push(userId);
-    if (recentUsers.length > RECENT_MAX) recentUsers.shift();
-  }
-}
-
-// Admin: list recent users with displayName/userId/silence status
-app.get("/admin/users", (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ ok:false, error:"unauthorized" });
-  const list = [...new Set(recentUsers)].reverse().map(uid => {
-    const p = userProfiles.get(uid) || {};
-    return {
-      userId: uid,
-      displayName: p.displayName || "Unknown",
-      lastSeenAt: p.lastSeenAt || null,
-      silencedUntil: humanLive.get(uid) || null
-    };
-  });
-  res.json({ ok:true, users: list });
-});
-
-// Pause by exact display name (optional convenience)
-app.post("/admin/takeoverByName", express.json(), (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ ok:false, error:"unauthorized" });
-  const { name, minutes = HUMAN_SILENCE_MINUTES } = req.body || {};
-  if (!name) return res.status(400).json({ ok:false, error:"missing name" });
-
-  const lower = String(name).toLowerCase();
-  const matches = [...userProfiles.entries()].filter(([uid, p]) =>
-    (p?.displayName || "").toLowerCase() === lower
-  );
-
-  if (matches.length === 0) return res.status(404).json({ ok:false, error:"name not found" });
-  if (matches.length > 1) {
-    return res.status(409).json({
-      ok:false,
-      error:"multiple matches",
-      candidates: matches.map(([uid, p]) => ({ userId: uid, displayName: p.displayName }))
-    });
-  }
-
-  const [userId] = matches[0];
-  const until = setHumanLive(userId, minutes);
-  return res.json({ ok:true, userId, until });
-});
-
-// Core admin endpoints
 app.post("/admin/takeover", express.json(), (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   const { userId, minutes } = req.body || {};
@@ -197,9 +114,7 @@ app.post("/admin/resume", express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
-// ============================================================================
-// CSV load & product index (with aliases/tags/spec/pcs_per_bundle)
-// ============================================================================
+// ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
 let PRODUCTS = [];
 let NAME_INDEX = new Map(); // kept for potential debug/admin
 
@@ -284,6 +199,7 @@ async function loadProducts() {
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
+    // parse bundle into number if possible
     const piecesPerBundle = (() => {
       const v = Number(String(rawBundle).replace(/[^\d.]/g, ""));
       return Number.isFinite(v) && v > 0 ? v : null;
@@ -409,6 +325,7 @@ async function fetchOpenRouter(body, { title, referer }) {
           body: JSON.stringify(body),
         });
         if (r.status === 429 && attempt === 0) {
+          // backoff then retry once
           clearTimeout(timer);
           const wait = 800 + Math.floor(Math.random() * 800);
           await new Promise(res => setTimeout(res, wait));
@@ -515,63 +432,7 @@ function buildCatalogForPrompt() {
   }).join("\n");
 }
 
-// ---- LLM call: merge fragments + produce final sales reply
-const queue = [];
-function withLimiter(fn) {
-  return new Promise((resolve, reject) => {
-    const task = async () => {
-      inFlight++;
-      try {
-        const res = await fn();
-        resolve(res);
-      } catch (e) {
-        reject(e);
-      } finally {
-        inFlight--;
-        const next = queue.shift();
-        if (next) next();
-      }
-    };
-    if (inFlight < OPENROUTER_MAX_CONCURRENCY) task();
-    else queue.push(task);
-  });
-}
-async function fetchOpenRouter(body, { title, referer }) {
-  return withLimiter(async () => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
-      try {
-        const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-            "HTTP-Referer": referer,
-            "X-Title": title,
-          },
-          body: JSON.stringify(body),
-        });
-        if (r.status === 429 && attempt === 0) {
-          clearTimeout(timer);
-          const wait = 800 + Math.floor(Math.random() * 800);
-          await new Promise(res => setTimeout(res, wait));
-          continue;
-        }
-        if (!r.ok) {
-          const text = await r.text().catch(() => "");
-          throw new Error(`OpenRouter ${r.status}: ${text || r.statusText}`);
-        }
-        const data = await r.json();
-        return data;
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-    throw new Error("OpenRouter 429");
-  });
-}
+// ---- Unified LLM call: merge fragments + produce final sales reply
 async function answerOnceWithLLM(frags, history = []) {
   const productList = buildCatalogForPrompt();
   const systemPrompt = buildSystemPrompt(productList);
@@ -585,7 +446,7 @@ async function answerOnceWithLLM(frags, history = []) {
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          ...history.slice(-20),
+          ...history.slice(-20),   // keep last 20 turns
           { role: "user", content: user }
         ]
       }, { title: `my-shop-prices single-call (${model})`, referer: "https://github.com/prestige959-tech/my-shop-prices"});
@@ -598,13 +459,16 @@ async function answerOnceWithLLM(frags, history = []) {
       return content.trim();
     } catch (e) {
       const msg = String(e?.message || "");
+      // if 429/rate-limited upstream, try next model immediately
       if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429")) {
         lastErr = e;
         continue;
       }
+      // otherwise, bubble up the error
       throw e;
     }
   }
+  // All models failed
   throw lastErr || new Error("All models failed");
 }
 
@@ -621,17 +485,14 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       const text = ev?.message?.text?.trim();
       if (!userId || !text) continue;
 
-      // capture profile for admin list
-      await ensureProfile(ev, lineClient);
-
       console.log("IN:", { userId, text });
 
-      // === human takeover guard ===
+      // === NEW: human takeover guard ===
       if (isHumanLive(userId)) {
-        console.log("Silenced user → bot stays quiet:", userId);
-        // Optionally extend timer on ping:
+        // Extend timer on ping if you prefer:
         // setHumanLive(userId, HUMAN_SILENCE_MINUTES);
-        continue;
+        console.log("Silenced user → bot stays quiet:", userId);
+        continue; // skip AI reply entirely
       }
 
       const history = await getContext(userId);
@@ -643,6 +504,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
         const askedSpecNow   = SPEC_RE.test(lastUserMsg);
         const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
 
+        // persist intent when explicitly asked now
         if (askedSpecNow || askedBundleNow) {
           pendingIntent.set(userId, {
             spec: askedSpecNow,
@@ -655,6 +517,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           if (intent) {
             const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
             if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
+              // append a virtual line that hints the continuation to the model
               if (intent.spec)   frags.push("ขอขนาด");
               if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
             }
