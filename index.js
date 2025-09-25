@@ -11,6 +11,10 @@ const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
 const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
 const MODEL = process.env.MODEL || "deepseek/deepseek-chat-v3.1";
+const MODELS = (process.env.MODELS || `${MODEL},deepseek/deepseek-chat-v3-0324`)
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
 const SILENCE_MS = Number(process.env.SILENCE_MS || 15000);
 const MAX_FRAGS = Number(process.env.MAX_FRAGS || 16);
@@ -24,6 +28,7 @@ console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 console.log("ENV → LINE_CHANNEL_SECRET:", mask(LINE_CHANNEL_SECRET));
 console.log("ENV → OPENROUTER_API_KEY:", mask(OPENROUTER_API_KEY));
 console.log("ENV → MODEL:", MODEL);
+console.log("ENV → MODELS:", MODELS.join(", "));
 console.log("ENV → SILENCE_MS:", SILENCE_MS, "MAX_FRAGS:", MAX_FRAGS, "MAX_WINDOW_MS:", MAX_WINDOW_MS);
 console.log("ENV → OPENROUTER_MAX_CONCURRENCY:", OPENROUTER_MAX_CONCURRENCY);
 
@@ -376,25 +381,41 @@ function buildCatalogForPrompt() {
 async function answerOnceWithLLM(frags, history = []) {
   const productList = buildCatalogForPrompt();
   const systemPrompt = buildSystemPrompt(productList);
+  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("
+");
 
-  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
+  let lastErr;
+  for (const model of MODELS) {
+    try {
+      const data = await fetchOpenRouter({
+        model,
+        temperature: 0.7,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...history.slice(-20),   // keep last 20 turns
+          { role: "user", content: user }
+        ]
+      }, { title: `my-shop-prices single-call (${model})`, referer: "https://github.com/prestige959-tech/my-shop-prices"});
 
-  const data = await fetchOpenRouter({
-    model: MODEL,
-    temperature: 0.7,
-    messages: [
-      { role: "system", content: systemPrompt },
-      ...history.slice(-20),   // keep last 20 turns
-      { role: "user", content: user }
-    ]
-  }, { title: "my-shop-prices single-call", referer: "https://github.com/prestige959-tech/my-shop-prices"});
-
-  const content =
-    data?.choices?.[0]?.message?.content ??
-    data?.choices?.[0]?.text ??
-    null;
-  if (!content) throw new Error("No content from OpenRouter");
-  return content.trim();
+      const content =
+        data?.choices?.[0]?.message?.content ??
+        data?.choices?.[0]?.text ??
+        null;
+      if (!content) throw new Error("No content from OpenRouter");
+      return content.trim();
+    } catch (e) {
+      const msg = String(e?.message || "");
+      // if 429/rate-limited upstream, try next model immediately
+      if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429")) {
+        lastErr = e;
+        continue;
+      }
+      // otherwise, bubble up the error
+      throw e;
+    }
+  }
+  // All models failed
+  throw lastErr || new Error("All models failed");
 }
 
 // ---- LINE webhook
