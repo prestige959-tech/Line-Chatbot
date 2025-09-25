@@ -381,8 +381,8 @@ function buildCatalogForPrompt() {
 async function answerOnceWithLLM(frags, history = []) {
   const productList = buildCatalogForPrompt();
   const systemPrompt = buildSystemPrompt(productList);
-  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("
-");
+  const user = frags.map((f, i) => `[${i+1}] ${f}`).join("\n");
+
 
   let lastErr;
   for (const model of MODELS) {
