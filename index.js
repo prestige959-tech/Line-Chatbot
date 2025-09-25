@@ -1,11 +1,10 @@
-// index2.js — LINE bot with OpenRouter + human takeover + Redis-based user list
-// (Merged missing logic from index.js into index2.js)
+// index.js — LINE bot with single OpenRouter call per batch, env-wired batching, 429 backoff,
+// simple concurrency limiter, AND human-takeover silence mode with Railway admin endpoints.
 
 import express from "express";
-import * as line from "@line/bot-sdk";
+import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
 import { getContext, setContext } from "./chatMemory.js";
-import Redis from "ioredis";
 
 const app = express();
 
@@ -15,17 +14,21 @@ const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
 const MODEL = process.env.MODEL || "deepseek/deepseek-chat-v3.1";
 const MODELS = (process.env.MODELS || `${MODEL},deepseek/deepseek-chat-v3-0324`)
-  .split(",").map(s => s.trim()).filter(Boolean);
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
 
 const SILENCE_MS = Number(process.env.SILENCE_MS || 15000);
 const MAX_FRAGS = Number(process.env.MAX_FRAGS || 16);
 const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000);
 const OPENROUTER_MAX_CONCURRENCY = Number(process.env.OPENROUTER_MAX_CONCURRENCY || 2);
 const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 25000);
+
+// NEW: Admin token for Railway control endpoints
 const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
+// How long to silence when taking over (minutes) — override per request body if needed
 const HUMAN_SILENCE_MINUTES = Number(process.env.HUMAN_SILENCE_MINUTES || 60);
 
-// ---- Pretty mask + env logs (from index.js)
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
 console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
@@ -44,14 +47,13 @@ if (!OPENROUTER_API_KEY) {
   console.warn("⚠️ Missing OPENROUTER_API_KEY — model calls will fail.");
 }
 
-// ---- Redis ----
-const redis = new Redis(process.env.REDIS_URL);
-
-// ---- LINE Config ----
-const lineConfig = { channelAccessToken: LINE_ACCESS_TOKEN, channelSecret: LINE_CHANNEL_SECRET };
+const lineConfig = {
+  channelAccessToken: LINE_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET,
+};
 const lineClient = new line.Client(lineConfig);
 
-// ---- Small helpers (from index.js)
+// ---- Small helpers ----
 function norm(s) {
   return (s || "")
     .toLowerCase()
@@ -66,25 +68,33 @@ function tokens(s) {
 }
 
 // ============================================================================
-// Human takeover (merged)
+// NEW: Human-takeover (silence mode) — per-user flag + Railway admin endpoints
 // ============================================================================
+
+/** userId -> silence-until timestamp (ms) */
 const humanLive = new Map();
+
 function setHumanLive(userId, minutes = HUMAN_SILENCE_MINUTES) {
   const until = Date.now() + minutes * 60_000;
   humanLive.set(userId, until);
   return until;
 }
-function clearHumanLive(userId) { humanLive.delete(userId); }
+function clearHumanLive(userId) {
+  humanLive.delete(userId);
+}
 function isHumanLive(userId) {
   const until = humanLive.get(userId);
   if (!until) return false;
   if (Date.now() > until) { humanLive.delete(userId); return false; }
   return true;
 }
+
+// Protected admin endpoints — call from PC/phone (Postman/Shortcuts) to silence/resume
 function isAdmin(req) {
   const token = (req.headers["x-admin-token"] || "").toString().trim();
   return !!ADMIN_TOKEN && token === ADMIN_TOKEN;
 }
+
 app.post("/admin/takeover", express.json(), (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   const { userId, minutes } = req.body || {};
@@ -94,6 +104,7 @@ app.post("/admin/takeover", express.json(), (req, res) => {
   console.log("[ADMIN] takeover", userId, "for", mins, "min → until", new Date(until).toISOString());
   res.json({ ok: true, until });
 });
+
 app.post("/admin/resume", express.json(), (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   const { userId } = req.body || {};
@@ -103,11 +114,9 @@ app.post("/admin/resume", express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
-// ============================================================================
-// CSV product loading (from index.js)
-// ============================================================================
+// ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
 let PRODUCTS = [];
-let NAME_INDEX = new Map();
+let NAME_INDEX = new Map(); // kept for potential debug/admin
 
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
@@ -190,6 +199,7 @@ async function loadProducts() {
     const codeMatch = rawName.match(/#\s*(\d+)/);
     const num = codeMatch ? codeMatch[1] : null;
 
+    // parse bundle into number if possible
     const piecesPerBundle = (() => {
       const v = Number(String(rawBundle).replace(/[^\d.]/g, ""));
       return Number.isFinite(v) && v > 0 ? v : null;
@@ -218,7 +228,7 @@ async function loadProducts() {
   console.log(`Loaded ${PRODUCTS.length} products from CSV. (aliases/tags/specs supported)`);
 }
 
-// ---- 15s silence window buffer (per user)
+// ---- 15s silence window buffer (per user) — now env-wired
 const buffers = new Map();
 
 function pushFragment(userId, text, onReady, silenceMs = SILENCE_MS, maxWindowMs = MAX_WINDOW_MS, maxFrags = MAX_FRAGS) {
@@ -246,7 +256,7 @@ function pushFragment(userId, text, onReady, silenceMs = SILENCE_MS, maxWindowMs
 }
 
 // --- One-turn intent memory per user (size/bundle), cancelled on topic switch
-const pendingIntent = new Map();
+const pendingIntent = new Map(); // userId -> { spec:boolean, bundle:boolean, group:string, ts:number }
 
 function baseTokens(s) { return tokens(s).map(t => norm(t)); }
 function detectProductGroup(query) {
@@ -315,6 +325,7 @@ async function fetchOpenRouter(body, { title, referer }) {
           body: JSON.stringify(body),
         });
         if (r.status === 429 && attempt === 0) {
+          // backoff then retry once
           clearTimeout(timer);
           const wait = 800 + Math.floor(Math.random() * 800);
           await new Promise(res => setTimeout(res, wait));
@@ -435,7 +446,7 @@ async function answerOnceWithLLM(frags, history = []) {
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          ...history.slice(-20),
+          ...history.slice(-20),   // keep last 20 turns
           { role: "user", content: user }
         ]
       }, { title: `my-shop-prices single-call (${model})`, referer: "https://github.com/prestige959-tech/my-shop-prices"});
@@ -448,19 +459,20 @@ async function answerOnceWithLLM(frags, history = []) {
       return content.trim();
     } catch (e) {
       const msg = String(e?.message || "");
+      // if 429/rate-limited upstream, try next model immediately
       if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429")) {
         lastErr = e;
         continue;
       }
+      // otherwise, bubble up the error
       throw e;
     }
   }
+  // All models failed
   throw lastErr || new Error("All models failed");
 }
 
-// ============================================================================
-// LINE Webhook (Redis features preserved)
-// ============================================================================
+// ---- LINE webhook
 app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
   res.status(200).end();
 
@@ -475,44 +487,24 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       console.log("IN:", { userId, text });
 
-      // --- Save user profile in Redis ---
-      try {
-        const profile = await lineClient.getProfile(userId);
-        await redis.set(`user:${userId}`, profile.displayName || "Unknown");
-      } catch (e) {
-        console.warn("Profile fetch failed:", e.message);
-      }
-
-      // --- NEW: /listusers command ---
-      if (text === "/listusers") {
-        const keys = await redis.keys("user:*");
-        if (!keys.length) {
-          await lineClient.replyMessage(ev.replyToken, { type: "text", text: "ยังไม่มีผู้ใช้ในระบบค่ะ" });
-          continue;
-        }
-        const values = await Promise.all(keys.map(k => redis.get(k)));
-        const users = keys.map((k, i) => `${values[i] || "Unknown"} (${k.replace("user:", "")})`);
-        const output = "📋 Users:\n" + users.slice(0, 50).join("\n") +
-          (users.length > 50 ? `\n...และอีก ${users.length - 50} คน` : "");
-        await lineClient.replyMessage(ev.replyToken, { type: "text", text: output });
-        continue;
-      }
-
-      // === Human takeover guard ===
+      // === NEW: human takeover guard ===
       if (isHumanLive(userId)) {
+        // Extend timer on ping if you prefer:
+        // setHumanLive(userId, HUMAN_SILENCE_MINUTES);
         console.log("Silenced user → bot stays quiet:", userId);
-        continue;
+        continue; // skip AI reply entirely
       }
 
-      // ---------- Fragment buffer + intent carryover (merged) ----------
       const history = await getContext(userId);
 
       pushFragment(userId, text, async (frags) => {
+        // ---------- One-turn size/bundle intent carry with topic switch guard ----------
         const lastUserMsg = (frags[frags.length - 1] || "");
         const lastGroup   = detectProductGroup(lastUserMsg);
         const askedSpecNow   = SPEC_RE.test(lastUserMsg);
         const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
 
+        // persist intent when explicitly asked now
         if (askedSpecNow || askedBundleNow) {
           pendingIntent.set(userId, {
             spec: askedSpecNow,
@@ -525,6 +517,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           if (intent) {
             const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
             if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
+              // append a virtual line that hints the continuation to the model
               if (intent.spec)   frags.push("ขอขนาด");
               if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
             }
@@ -545,7 +538,10 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
         await setContext(userId, history);
 
         try {
-          await lineClient.replyMessage(ev.replyToken, { type: "text", text: (reply || "").slice(0, 5000) });
+          await lineClient.replyMessage(ev.replyToken, {
+            type: "text",
+            text: (reply || "").slice(0, 5000)
+          });
         } catch (err) {
           console.warn("Reply failed (possibly expired token):", err?.message);
         }
@@ -561,6 +557,8 @@ app.get("/", (_req, res) => res.send("LINE bot is running"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  await loadProducts().catch(err => console.error("Failed to load products.csv:", err?.message));
+  await loadProducts().catch(err => {
+    console.error("Failed to load products.csv:", err?.message);
+  });
   console.log("Bot running on port", PORT);
 });
