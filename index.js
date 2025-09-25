@@ -1,4 +1,4 @@
-// index.js (LINE version — AI-only product selection + female Thai sales specialist, 20-turn memory)
+// index.js — LINE bot with single OpenRouter call per batch, env-wired batching, 429 backoff, and simple concurrency limiter
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
@@ -10,7 +10,13 @@ const app = express();
 const LINE_ACCESS_TOKEN = (process.env.LINE_ACCESS_TOKEN || "").trim();
 const LINE_CHANNEL_SECRET = (process.env.LINE_CHANNEL_SECRET || "").trim();
 const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
-const MODEL = process.env.MODEL || "moonshotai/kimi-k2";
+const MODEL = process.env.MODEL || "deepseek/deepseek-chat-v3.1";
+
+const SILENCE_MS = Number(process.env.SILENCE_MS || 15000);
+const MAX_FRAGS = Number(process.env.MAX_FRAGS || 16);
+const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000);
+const OPENROUTER_MAX_CONCURRENCY = Number(process.env.OPENROUTER_MAX_CONCURRENCY || 2);
+const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 25000);
 
 const mask = s =>
   !s ? "(empty)" : s.replace(/\s+/g, "").slice(0, 4) + "..." + s.replace(/\s+/g, "").slice(-4);
@@ -18,6 +24,8 @@ console.log("ENV → LINE_ACCESS_TOKEN:", mask(LINE_ACCESS_TOKEN));
 console.log("ENV → LINE_CHANNEL_SECRET:", mask(LINE_CHANNEL_SECRET));
 console.log("ENV → OPENROUTER_API_KEY:", mask(OPENROUTER_API_KEY));
 console.log("ENV → MODEL:", MODEL);
+console.log("ENV → SILENCE_MS:", SILENCE_MS, "MAX_FRAGS:", MAX_FRAGS, "MAX_WINDOW_MS:", MAX_WINDOW_MS);
+console.log("ENV → OPENROUTER_MAX_CONCURRENCY:", OPENROUTER_MAX_CONCURRENCY);
 
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.warn("⚠️ Missing LINE credentials — webhook will not work correctly.");
@@ -38,7 +46,7 @@ function norm(s) {
     .toLowerCase()
     .normalize("NFKC")
     .replace(/[ \t\r\n]/g, "")
-    .replace(/[.,;:!?'""“”‘’(){}\[\]<>|/\\\\\\\\-_=+]/g, "");
+    .replace(/[.,;:!?'"“”‘’(){}\[\]<>|/\\\\\-_=+]/g, "");
 }
 function tokens(s) {
   const t = (s || "").toLowerCase();
@@ -48,7 +56,7 @@ function tokens(s) {
 
 // ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
 let PRODUCTS = [];
-let NAME_INDEX = new Map(); // kept for potential debug/admin — not used for selection
+let NAME_INDEX = new Map(); // kept for potential debug/admin
 
 async function loadProducts() {
   let csv = await readFile(new URL("./products.csv", import.meta.url), "utf8");
@@ -160,10 +168,10 @@ async function loadProducts() {
   console.log(`Loaded ${PRODUCTS.length} products from CSV. (aliases/tags/specs supported)`);
 }
 
-// ---- 15s silence window buffer (per user) ----
+// ---- 15s silence window buffer (per user) — now env-wired
 const buffers = new Map();
 
-function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60000, maxFrags = 16) {
+function pushFragment(userId, text, onReady, silenceMs = SILENCE_MS, maxWindowMs = MAX_WINDOW_MS, maxFrags = MAX_FRAGS) {
   let buf = buffers.get(userId);
   const now = Date.now();
   if (!buf) { buf = { frags: [], timer: null, firstAt: now }; buffers.set(userId, buf); }
@@ -185,79 +193,6 @@ function pushFragment(userId, text, onReady, silenceMs = 15000, maxWindowMs = 60
 
   if (buf.timer) clearTimeout(buf.timer);
   buf.timer = setTimeout(fire, silenceMs);
-}
-
-// ---- Semantic Reassembly → JSON (via OpenRouter)
-function heuristicJson(frags) {
-  const text = frags.join(" / ").trim();
-  return { merged_text: text, items: [], followups: [text] };
-}
-
-async function reassembleToJSON(frags, history = []) {
-  if (!frags?.length) return heuristicJson([]);
-
-  const sys = `
-You are a conversation normalizer for a Thai retail shop chat.
-
-TASK
-- You receive multiple short message fragments from a customer.
-- Merge them into ONE concise Thai sentence and extract a structured list of items.
-
-OUTPUT (JSON ONLY, MINIFIED — no markdown, comments, or extra text)
-{
-  "merged_text":"string",
-  "items":[
-    {"product":"string","qty":number|null,"unit":"string|null"}
-  ],
-  "followups":["string", ...]
-}
-
-RULES
-- Do NOT hallucinate products or quantities.
-- Preserve user-provided units exactly (e.g., เส้น/ตัว/กก./เมตร).
-- If quantity is missing or ambiguous → "qty": null.
-- If the product is unclear or not stated → leave "items" empty and put the customer’s questions/intents into "followups".
-- Keep delivery/payment/stock questions in "followups".
-- "merged_text" must be short, natural Thai, combining the fragments into a single sentence.
-- Return valid, minified JSON only. No extra whitespace.
-`.trim();
-
-  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
-
-  try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/Line-Chatbot",
-        "X-Title": "line-bot reassembler json"
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: sys },
-          ...history.slice(-4),
-          { role: "user", content: user }
-        ]
-      })
-    });
-    if (!r.ok) throw new Error(`OpenRouter ${r.status}`);
-    const data = await r.json();
-    const content = data?.choices?.[0]?.message?.content?.trim();
-    if (!content) throw new Error("empty reassembler content");
-    let parsed;
-    try { parsed = JSON.parse(content); }
-    catch { parsed = heuristicJson(frags); }
-    if (!parsed || typeof parsed !== "object" || !("merged_text" in parsed)) {
-      return heuristicJson(frags);
-    }
-    return parsed;
-  } catch (err) {
-    console.warn("Reassembler failed, using heuristic:", err?.message);
-    return heuristicJson(frags);
-  }
 }
 
 // --- One-turn intent memory per user (size/bundle), cancelled on topic switch
@@ -288,31 +223,84 @@ function looksLikeProductOnly(msg) {
   return baseTokens(m).length > 0;
 }
 
-// ---- OpenRouter chat with sales-specialist prompt (20-turn memory)
-async function askOpenRouter(userText, history = []) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
+// ---- Simple concurrency limiter
+let inFlight = 0;
+const queue = [];
+function withLimiter(fn) {
+  return new Promise((resolve, reject) => {
+    const task = async () => {
+      inFlight++;
+      try {
+        const res = await fn();
+        resolve(res);
+      } catch (e) {
+        reject(e);
+      } finally {
+        inFlight--;
+        const next = queue.shift();
+        if (next) next();
+      }
+    };
+    if (inFlight < OPENROUTER_MAX_CONCURRENCY) task();
+    else queue.push(task);
+  });
+}
 
-  const productList = PRODUCTS.map(p => {
-    const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
-    const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
-    const aliasTxt = (p.aliases && p.aliases.length) ? ` | aliases: ${p.aliases.join(", ")}` : "";
-    const tagTxt   = (p.tags && p.tags.length) ? ` | tags: ${p.tags.join(", ")}` : "";
-    const specTxt  = p.specification ? ` | ขนาด: ${p.specification}` : "";
-    const bundleTxt= (p.pcsPerBundle ? ` | pcs_per_bundle: ${p.pcsPerBundle}` : (p.bundleRaw ? ` | pcs_per_bundle: ${p.bundleRaw}` : ""));
-    return `${p.name} = ${priceTxt}${unitTxt}${aliasTxt}${tagTxt}${specTxt}${bundleTxt}`;
-  }).join("\n");
+// ---- OpenRouter call helper with timeout + one 429 retry
+async function fetchOpenRouter(body, { title, referer }) {
+  return withLimiter(async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), OPENROUTER_TIMEOUT_MS);
+      try {
+        const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            "HTTP-Referer": referer,
+            "X-Title": title,
+          },
+          body: JSON.stringify(body),
+        });
+        if (r.status === 429 && attempt === 0) {
+          // backoff then retry once
+          clearTimeout(timer);
+          const wait = 800 + Math.floor(Math.random() * 800);
+          await new Promise(res => setTimeout(res, wait));
+          continue;
+        }
+        if (!r.ok) {
+          const text = await r.text().catch(() => "");
+          throw new Error(`OpenRouter ${r.status}: ${text || r.statusText}`);
+        }
+        const data = await r.json();
+        return data;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw new Error("OpenRouter 429");
+  });
+}
 
-  const systemPrompt = `
-You are a Thai sales specialist for a building-materials shop.
+// ---- Build unified system prompt (merge + answer)
+function buildSystemPrompt(productList) {
+  return `You are BOTH (1) a conversation normalizer for a Thai retail shop chat and (2) a Thai sales specialist for a building-materials shop.
 Always reply in Thai, concise, friendly, and in a female, polite tone (use ค่ะ / นะคะ naturally). Use emojis sparingly (0–1 when it helps).
+
+FIRST — NORMALIZE INPUT (internal reasoning only)
+- You will receive multiple short message fragments from a customer in the user message, each prefixed with [n].
+- Internally merge them into ONE concise Thai sentence ("merged_text").
+- Use this merged_text as the basis for answering. Do not output JSON; only output the final Thai reply.
 
 CATALOG (authoritative — use this only; do not invent prices)
 <Each line is: product name = price Baht per unit | aliases: ... | tags: ... | ขนาด: ... | pcs_per_bundle: ...>
 ${productList}
 
 CONTEXT (very important)
-- Answer based ONLY on the customer’s latest message.
+- Answer based ONLY on the customer’s latest message (the merged_text of the latest fragments).
 - However, if the previous customer turn explicitly asked about size/spec ("ขนาด/สเปค", กว้าง/ยาว/หนา) or bundle size ("1 มัดมีกี่…"), and you asked a clarifying question (e.g., which model), then treat the user’s next reply that contains only a product name/variant as a continuation of that intent:
   • For size/spec continuation → include ขนาด from the catalog.
   • For bundle-size continuation → answer with pcs_per_bundle + correct unit.
@@ -326,7 +314,6 @@ COMPANY INFO
 
 MATCHING (aliases/tags)
 - Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and ขนาด.
-- The word "โครงซีลาย" should always be interpreted as "ซีลาย".
 - If multiple items fit, list the best 1–3 with a short reason why they match.
 - If nothing matches clearly, suggest the closest alternatives and ask ONE short clarifying question.
 
@@ -348,7 +335,6 @@ SPECIFICATION HANDLING
 - If the customer asks about any dimension (length, width, thickness, ขนาด, สเปค, กว้าง, ยาว, หนา):
   • Answer ONLY using the "ขนาด" field (from specification in the catalog).
   • Present it naturally prefixed with "ขนาด", never the English word "specification".
-  • Example: "ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm".
 - If the customer asks again, repeats the question, or shows doubt/unsatisfaction about the size answer:
   • Do not try to re-explain or guess.
   • Politely suggest they call 088-277-0145 immediately for confirmation.
@@ -369,67 +355,46 @@ POLICIES (only when asked or relevant)
 - Payment: โอนก่อนเท่านั้น.
 - Delivery: กรุงเทพฯและปริมณฑลใช้ Lalamove ร้านเป็นผู้เรียกรถ ลูกค้าชำระค่าส่งเอง.
 
-TONE & EMPATHY
-- Be warm and respectful; greet at the start of a new conversation and close politely when appropriate.
-- If the customer shows concern, acknowledge politely before providing options.
+OUTPUT
+- Output ONLY the final Thai reply (no JSON, no "merged_text" label).`;
+}
 
-DO NOT
-- Do not claim stock status, shipping time, or payment confirmation unless asked.
-- Do not invent or alter catalog data.
-- Do not include unrelated items from previous questions unless explicitly referenced.
+// ---- Build product list text for the system prompt
+function buildCatalogForPrompt() {
+  return PRODUCTS.map(p => {
+    const priceTxt = Number.isFinite(p.price) ? `${p.price} บาท` : (p.price || "—");
+    const unitTxt  = p.unit ? ` ต่อ ${p.unit}` : "";
+    const aliasTxt = (p.aliases && p.aliases.length) ? ` | aliases: ${p.aliases.join(", ")}` : "";
+    const tagTxt   = (p.tags && p.tags.length) ? ` | tags: ${p.tags.join(", ")}` : "";
+    const specTxt  = p.specification ? ` | ขนาด: ${p.specification}` : "";
+    const bundleTxt= (p.pcsPerBundle ? ` | pcs_per_bundle: ${p.pcsPerBundle}` : (p.bundleRaw ? ` | pcs_per_bundle: ${p.bundleRaw}` : ""));
+    return `${p.name} = ${priceTxt}${unitTxt}${aliasTxt}${tagTxt}${specTxt}${bundleTxt}`;
+  }).join("\n");
+}
 
-OUTPUT QUALITY
-- Keep it concise, clear, and helpful.
-- Prioritize correctness and readability.
+// ---- Unified LLM call: merge fragments + produce final sales reply
+async function answerOnceWithLLM(frags, history = []) {
+  const productList = buildCatalogForPrompt();
+  const systemPrompt = buildSystemPrompt(productList);
 
-Examples:
-Customer: 1 มัดมีกี่เส้นคะ
-Assistant: 10 เส้นค่ะ
+  const user = frags.map((f,i)=>`[${i+1}] ${f}`).join("\n");
 
-Customer: ขนาดซีลาย 26 เต็ม
-Assistant: ซีลาย # 26 เต็ม 6.0-6.5 กก./มัด ราคา 20 บาท ต่อ เส้นค่ะ • ขนาด กว้าง 36 mm x สูง 11 mm x ยาว 4000 mm หนา 0.32-0.35 mm
+  const data = await fetchOpenRouter({
+    model: MODEL,
+    temperature: 0.7,
+    messages: [
+      { role: "system", content: systemPrompt },
+      ...history.slice(-20),   // keep last 20 turns
+      { role: "user", content: user }
+    ]
+  }, { title: "my-shop-prices single-call", referer: "https://github.com/prestige959-tech/my-shop-prices"});
 
-Customer: ซีลาย ราคาเท่าไหร่
-Assistant:
-• ซีลาย # 26 เบา 5.6-5.9 กก./มัด ราคา 19 บาท ต่อ เส้นค่ะ
-• ซีลาย # 26 เต็ม 6.0-6.5 กก./มัด ราคา 20 บาท ต่อ เส้นค่ะ
-`.trim();
-
-  try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "HTTP-Referer": "https://github.com/prestige959-tech/my-shop-prices",
-        "X-Title": "my-shop-prices line-bot"
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        temperature: 0.7,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...history.slice(-20),   // <-- keep last 20 turns
-          { role: "user", content: userText }
-        ]
-      })
-    });
-
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      throw new Error(`OpenRouter ${r.status}: ${text || r.statusText}`);
-    }
-    const data = await r.json();
-    const content =
-      data?.choices?.[0]?.message?.content ??
-      data?.choices?.[0]?.text ??
-      null;
-    if (!content) throw new Error("No content from OpenRouter");
-    return content.trim();
-  } finally {
-    clearTimeout(timeout);
-  }
+  const content =
+    data?.choices?.[0]?.message?.content ??
+    data?.choices?.[0]?.text ??
+    null;
+  if (!content) throw new Error("No content from OpenRouter");
+  return content.trim();
 }
 
 // ---- LINE webhook
@@ -450,32 +415,18 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       const history = await getContext(userId);
 
       pushFragment(userId, text, async (frags) => {
-        const parsed = await reassembleToJSON(frags, history);
-
-        let mergedForAssistant = parsed.merged_text || frags.join(" / ");
-        if (parsed.items?.length) {
-          const itemsPart = parsed.items
-            .map(it => {
-              const qty = (it.qty != null && !Number.isNaN(it.qty)) ? ` ${it.qty}` : "";
-              const unit = it.unit ? ` ${it.unit}` : "";
-              return `${it.product || ""}${qty}${unit}`.trim();
-            })
-            .filter(Boolean)
-            .join(" / ");
-          mergedForAssistant = itemsPart + (parsed.followups?.length ? " / " + parsed.followups.join(" / ") : "");
-        }
-
         // ---------- One-turn size/bundle intent carry with topic switch guard ----------
         const lastUserMsg = (frags[frags.length - 1] || "");
         const lastGroup   = detectProductGroup(lastUserMsg);
         const askedSpecNow   = SPEC_RE.test(lastUserMsg);
         const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
 
+        // persist intent when explicitly asked now
         if (askedSpecNow || askedBundleNow) {
           pendingIntent.set(userId, {
             spec: askedSpecNow,
             bundle: askedBundleNow,
-            group: lastGroup || detectProductGroup(mergedForAssistant) || null,
+            group: lastGroup || null,
             ts: Date.now()
           });
         } else {
@@ -483,8 +434,9 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
           if (intent) {
             const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
             if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
-              if (intent.spec)   mergedForAssistant = `${mergedForAssistant} / ขอขนาด`;
-              if (intent.bundle) mergedForAssistant = `${mergedForAssistant} / 1 มัดมีกี่หน่วย`;
+              // append a virtual line that hints the continuation to the model
+              if (intent.spec)   frags.push("ขอขนาด");
+              if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
             }
             pendingIntent.delete(userId);
           }
@@ -492,15 +444,13 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
         let reply;
         try {
-          reply = await askOpenRouter(mergedForAssistant, history);
+          reply = await answerOnceWithLLM(frags, history);
         } catch (e) {
           console.error("OpenRouter error:", e?.message);
           reply = "ขอโทษค่ะ ระบบขัดข้องชั่วคราว กรุณาโทร 088-277-0145 นะคะ 🙏";
         }
 
         for (const f of frags) history.push({ role: "user", content: f });
-        history.push({ role: "user", content: `(รวมข้อความ JSON): ${JSON.stringify(parsed)}` });
-        history.push({ role: "user", content: `(รวมข้อความพร้อมใช้งาน): ${mergedForAssistant}` });
         history.push({ role: "assistant", content: reply });
         await setContext(userId, history);
 
@@ -512,7 +462,7 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
         } catch (err) {
           console.warn("Reply failed (possibly expired token):", err?.message);
         }
-      }, 15000);
+      }, SILENCE_MS, MAX_WINDOW_MS, MAX_FRAGS);
     } catch (e) {
       console.error("Webhook handler error:", e?.message);
     }
