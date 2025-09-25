@@ -516,7 +516,6 @@ function buildCatalogForPrompt() {
 }
 
 // ---- LLM call: merge fragments + produce final sales reply
-let inFlight = 0;
 const queue = [];
 function withLimiter(fn) {
   return new Promise((resolve, reject) => {
