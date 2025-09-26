@@ -48,3 +48,23 @@ export async function getUsersWithProfiles(lineClient) {
 
   return usersWithProfiles;
 }
+
+export async function findUserIdByDisplayName(lineClient, displayName) {
+  const users = await getUsersWithProfiles(lineClient);
+  const normalizedSearchName = displayName.toLowerCase().trim();
+
+  // Try exact match first
+  let foundUser = users.find(user =>
+    user.displayName.toLowerCase().trim() === normalizedSearchName
+  );
+
+  // If no exact match, try partial match
+  if (!foundUser) {
+    foundUser = users.find(user =>
+      user.displayName.toLowerCase().includes(normalizedSearchName) ||
+      normalizedSearchName.includes(user.displayName.toLowerCase())
+    );
+  }
+
+  return foundUser ? foundUser.userId : null;
+}

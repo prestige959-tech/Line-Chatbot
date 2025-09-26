@@ -4,7 +4,7 @@
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
-import { getContext, setContext, getAllUserIds, getUsersWithProfiles } from "./chatMemory.js";
+import { getContext, setContext, getAllUserIds, getUsersWithProfiles, findUserIdByDisplayName } from "./chatMemory.js";
 
 const app = express();
 
@@ -95,23 +95,57 @@ function isAdmin(req) {
   return !!ADMIN_TOKEN && token === ADMIN_TOKEN;
 }
 
-app.post("/admin/takeover", express.json(), (req, res) => {
+app.post("/admin/takeover", express.json(), async (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const { userId, minutes } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false, error: "missing userId" });
+  const { userId, username, minutes } = req.body || {};
+
+  let targetUserId = userId;
+
+  // If username is provided instead of userId, find the userId
+  if (!targetUserId && username) {
+    try {
+      targetUserId = await findUserIdByDisplayName(lineClient, username);
+      if (!targetUserId) {
+        return res.status(404).json({ ok: false, error: "user not found with that username" });
+      }
+    } catch (error) {
+      console.error("[ADMIN] takeover username lookup error:", error?.message);
+      return res.status(500).json({ ok: false, error: "failed to lookup username" });
+    }
+  }
+
+  if (!targetUserId) return res.status(400).json({ ok: false, error: "missing userId or username" });
+
   const mins = Number.isFinite(Number(minutes)) ? Number(minutes) : HUMAN_SILENCE_MINUTES;
-  const until = setHumanLive(userId, mins);
-  console.log("[ADMIN] takeover", userId, "for", mins, "min → until", new Date(until).toISOString());
-  res.json({ ok: true, until });
+  const until = setHumanLive(targetUserId, mins);
+  console.log("[ADMIN] takeover", targetUserId, username ? `(username: ${username})` : "", "for", mins, "min → until", new Date(until).toISOString());
+  res.json({ ok: true, userId: targetUserId, until });
 });
 
-app.post("/admin/resume", express.json(), (req, res) => {
+app.post("/admin/resume", express.json(), async (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const { userId } = req.body || {};
-  if (!userId) return res.status(400).json({ ok: false, error: "missing userId" });
-  clearHumanLive(userId);
-  console.log("[ADMIN] resume", userId);
-  res.json({ ok: true });
+  const { userId, username } = req.body || {};
+
+  let targetUserId = userId;
+
+  // If username is provided instead of userId, find the userId
+  if (!targetUserId && username) {
+    try {
+      targetUserId = await findUserIdByDisplayName(lineClient, username);
+      if (!targetUserId) {
+        return res.status(404).json({ ok: false, error: "user not found with that username" });
+      }
+    } catch (error) {
+      console.error("[ADMIN] resume username lookup error:", error?.message);
+      return res.status(500).json({ ok: false, error: "failed to lookup username" });
+    }
+  }
+
+  if (!targetUserId) return res.status(400).json({ ok: false, error: "missing userId or username" });
+
+  clearHumanLive(targetUserId);
+  console.log("[ADMIN] resume", targetUserId, username ? `(username: ${username})` : "");
+  res.json({ ok: true, userId: targetUserId });
 });
 
 app.get("/admin/listusers", async (req, res) => {
