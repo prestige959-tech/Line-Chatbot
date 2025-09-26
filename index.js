@@ -4,7 +4,7 @@
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
-import { getContext, setContext, getAllUserIds, getUsersWithProfiles, findUserIdByDisplayName } from "./chatMemory.js";
+import { getContext, setContext, getAllUserIds, getUsersWithProfiles } from "./chatMemory.js";
 
 const app = express();
 
@@ -24,9 +24,7 @@ const MAX_WINDOW_MS = Number(process.env.MAX_WINDOW_MS || 60000);
 const OPENROUTER_MAX_CONCURRENCY = Number(process.env.OPENROUTER_MAX_CONCURRENCY || 2);
 const OPENROUTER_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS || 25000);
 
-// NEW: Admin token for Railway control endpoints
-const ADMIN_TOKEN = (process.env.ADMIN_TOKEN || "").trim();
-// How long to silence when taking over (minutes) — override per request body if needed
+// How long to silence when taking over (minutes)
 const HUMAN_SILENCE_MINUTES = Number(process.env.HUMAN_SILENCE_MINUTES || 60);
 
 const mask = s =>
@@ -92,76 +90,6 @@ function isHumanLive(userId) {
   return true;
 }
 
-// Protected admin endpoints — call from PC/phone (Postman/Shortcuts) to silence/resume
-function isAdmin(req) {
-  const token = (req.headers["x-admin-token"] || "").toString().trim();
-  return !!ADMIN_TOKEN && token === ADMIN_TOKEN;
-}
-
-app.post("/admin/takeover", express.json(), async (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const { userId, username, minutes } = req.body || {};
-
-  let targetUserId = userId;
-
-  // If username is provided instead of userId, find the userId
-  if (!targetUserId && username) {
-    try {
-      targetUserId = await findUserIdByDisplayName(lineClient, username);
-      if (!targetUserId) {
-        return res.status(404).json({ ok: false, error: "user not found with that username" });
-      }
-    } catch (error) {
-      console.error("[ADMIN] takeover username lookup error:", error?.message);
-      return res.status(500).json({ ok: false, error: "failed to lookup username" });
-    }
-  }
-
-  if (!targetUserId) return res.status(400).json({ ok: false, error: "missing userId or username" });
-
-  const mins = Number.isFinite(Number(minutes)) ? Number(minutes) : HUMAN_SILENCE_MINUTES;
-  const until = setHumanLive(targetUserId, mins);
-  console.log("[ADMIN] takeover", targetUserId, username ? `(username: ${username})` : "", "for", mins, "min → until", new Date(until).toISOString());
-  res.json({ ok: true, userId: targetUserId, until });
-});
-
-app.post("/admin/resume", express.json(), async (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  const { userId, username } = req.body || {};
-
-  let targetUserId = userId;
-
-  // If username is provided instead of userId, find the userId
-  if (!targetUserId && username) {
-    try {
-      targetUserId = await findUserIdByDisplayName(lineClient, username);
-      if (!targetUserId) {
-        return res.status(404).json({ ok: false, error: "user not found with that username" });
-      }
-    } catch (error) {
-      console.error("[ADMIN] resume username lookup error:", error?.message);
-      return res.status(500).json({ ok: false, error: "failed to lookup username" });
-    }
-  }
-
-  if (!targetUserId) return res.status(400).json({ ok: false, error: "missing userId or username" });
-
-  clearHumanLive(targetUserId);
-  console.log("[ADMIN] resume", targetUserId, username ? `(username: ${username})` : "");
-  res.json({ ok: true, userId: targetUserId });
-});
-
-app.get("/admin/listusers", async (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
-  try {
-    const users = await getUsersWithProfiles(lineClient);
-    console.log("[ADMIN] listusers → found", users.length, "users with profiles");
-    res.json({ ok: true, users, count: users.length });
-  } catch (error) {
-    console.error("[ADMIN] listusers error:", error?.message);
-    res.status(500).json({ ok: false, error: "failed to fetch users" });
-  }
-});
 
 // ---- CSV load & product index (with aliases/tags/spec/pcs_per_bundle) ----
 let PRODUCTS = [];
