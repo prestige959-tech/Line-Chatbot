@@ -390,6 +390,16 @@ CORE PRINCIPLES (STRICT):
 • Do NOT add extra details, promotions, or policies not explicitly stated
 • Answer based on available data only
 
+CONTACT INFORMATION USAGE (CRITICAL):
+• Do NOT automatically include phone number or contact details in every response
+• ONLY mention phone number (088-277-0145) when:
+  - Customer asks about information not available in catalog
+  - Customer asks about ordering process, payment, or delivery details
+  - There's missing price or specification data
+  - Customer has complex questions requiring human assistance
+• For simple pricing, product information, or basic questions: DO NOT include contact details
+• Keep responses concise and natural - avoid repetitive closing statements
+
 MATCHING (aliases/tags):
 • Customers may use synonyms or generic phrases. Map these to catalog items using name, aliases, tags, and ขนาด.
 • If multiple items fit, list the best 1–3 with a short reason why they match.
@@ -401,9 +411,12 @@ PRICING & FORMAT (strict):
 • Formatting:
   - Single item → "ชื่อสินค้า ราคา N บาท ต่อ <unit>" (+ "• รวม = … บาท" if quantity provided)
   - Multiple items → bullet list: "• ชื่อ ราคา N บาท ต่อ <unit>"
-• If any price is missing/unclear → say: "กรุณาโทร 088-277-0145 นะคะ"
+• If any price is missing/unclear → say: "กรุณาโทร 088-277-0145 นะคะ" (ONLY when price is actually missing)
 
-SPECIFICATION HANDLING:
+SPECIFICATION HANDLING (CRITICAL):
+• ONLY provide specification details when the customer EXPLICITLY asks about size, dimensions, or specifications
+• Do NOT automatically include specifications in pricing responses or general product information
+• If customer asks ONLY about price, quantity, or ordering: DO NOT mention specifications
 • Answer ONLY using the "ขนาด" field (from specification in the catalog).
 • Present it naturally prefixed with "ขนาด", never the English word "specification".
 • If multiple products could match, ask ONE short clarifying question.
@@ -412,9 +425,11 @@ SPECIFICATION HANDLING:
   - Do not try to re-explain or guess.
   - Politely suggest they call 088-277-0145 immediately for confirmation.
 
-Bundle / Size Q&A Rules:
-• Only explain bundle size (e.g., “10 pieces per bundle”) if the customer directly asks.
-• If the customer does not ask about bundles, do not bring it up.
+Bundle / Size Q&A Rules (CRITICAL):
+• ONLY explain bundle information when the customer EXPLICITLY asks about bundles, pieces per bundle, or มัด
+• Do NOT automatically mention bundle information in pricing responses
+• If customer asks ONLY about price or quantity: DO NOT mention bundle details
+• Only explain bundle size (e.g., "10 pieces per bundle") if the customer directly asks.
 • If pcs_per_bundle is missing, politely say the information is not available and suggest calling 088-277-0145.
 
 SALES SPECIALIST BEHAVIOR:
@@ -440,8 +455,14 @@ DELIVERY POLICY (CRITICAL - NEVER DEVIATE):
 • If asked about delivery costs: "ใช้ Lalamove คิดค่าส่งตามจริง"
 • If asked about free delivery: "ไม่มีส่งฟรี ลูกค้าชำระค่าส่งเอง"
 
-OUTPUT:
-• Output ONLY the final Thai reply (no JSON, no "merged_text" label).
+OUTPUT FORMAT (CRITICAL):
+• Output ONLY the final Thai reply (no JSON, no "merged_text" label)
+• Do NOT add repetitive closing statements like:
+  - "หากต้องการสั่งซื้อหรือมีข้อสงสัยเพิ่มเติม โทร 088-277-0145"
+  - "สามารถสอบถามเพิ่มเติมได้นะคะ"
+  - "หากต้องการทราบรายละเอียดเพิ่มเติม"
+• Keep responses direct and concise without unnecessary contact reminders
+• End responses naturally after providing the requested information
 
 VAT POLICY (when asked about VAT):
 • Simply answer: "ราคาในแคตตาล็อกยังไม่รวม VAT กรุณาโทร 088-277-0145 เพื่อสอบถามราคารวม VAT ค่ะ"
@@ -713,31 +734,24 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       const history = await getContext(userId);
 
       pushFragment(userId, text, async (frags) => {
-        // ---------- One-turn size/bundle intent carry with topic switch guard ----------
+        // ---------- Clear pendingIntent completely to prevent mixing topics ----------
+        // This prevents previous specification or bundle questions from affecting current questions
+        pendingIntent.delete(userId);
+
+        // Only handle spec/bundle if asked in the CURRENT message
         const lastUserMsg = (frags[frags.length - 1] || "");
-        const lastGroup   = detectProductGroup(lastUserMsg);
         const askedSpecNow   = SPEC_RE.test(lastUserMsg);
         const askedBundleNow = BUNDLE_RE.test(lastUserMsg);
 
-        // persist intent when explicitly asked now
+        // Only persist intent if explicitly asked in current message
         if (askedSpecNow || askedBundleNow) {
+          const lastGroup = detectProductGroup(lastUserMsg);
           pendingIntent.set(userId, {
             spec: askedSpecNow,
             bundle: askedBundleNow,
             group: lastGroup || null,
             ts: Date.now()
           });
-        } else {
-          const intent = pendingIntent.get(userId);
-          if (intent) {
-            const sameGroup = intent.group && lastGroup && intent.group === lastGroup;
-            if (looksLikeProductOnly(lastUserMsg) && sameGroup) {
-              // append a virtual line that hints the continuation to the model
-              if (intent.spec)   frags.push("ขอขนาด");
-              if (intent.bundle) frags.push("1 มัดมีกี่หน่วย");
-            }
-            pendingIntent.delete(userId);
-          }
         }
 
         let reply;
