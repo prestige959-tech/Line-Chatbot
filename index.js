@@ -74,6 +74,9 @@ function tokens(s) {
 /** userId -> silence-until timestamp (ms) */
 const humanLive = new Map();
 
+/** userId -> menu session state */
+const menuSessions = new Map();
+
 function setHumanLive(userId, minutes = HUMAN_SILENCE_MINUTES) {
   const until = Date.now() + minutes * 60_000;
   humanLive.set(userId, until);
@@ -533,30 +536,170 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
 
       console.log("IN:", { userId, text });
 
-      // === Check for /listusers command ===
+      // === Interactive Menu System ===
+      const session = menuSessions.get(userId);
+
+      // Main menu - /listusers command
       if (text.toLowerCase() === '/listusers') {
         try {
           const users = await getUsersWithProfiles(lineClient);
-          const userList = users.length > 0
-            ? `รายชื่อผู้ใช้ทั้งหมด (${users.length} คน):\n\n${users.map((user, index) =>
-                `${index + 1}. ${user.displayName}\n   ID: ${user.userId}`
-              ).join('\n\n')}`
-            : 'ยังไม่มีผู้ใช้ในระบบค่ะ';
+          if (users.length === 0) {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: "ยังไม่มีผู้ใช้ในระบบค่ะ"
+            });
+            continue;
+          }
+
+          const menuText = `รายชื่อผู้ใช้ทั้งหมด (${users.length} คน):\n\nเลือกการดำเนินการ:\n1. Pause ผู้ใช้\n2. Resume ผู้ใช้\n\nพิมพ์ตัวเลข 1 หรือ 2`;
+
+          menuSessions.set(userId, {
+            step: 'main_menu',
+            users: users,
+            timestamp: Date.now()
+          });
 
           await lineClient.replyMessage(ev.replyToken, {
             type: "text",
-            text: userList.slice(0, 5000)
+            text: menuText
           });
-          console.log("Sent user list with profiles:", users.length, "users");
+          console.log("Sent main menu to:", userId);
           continue;
         } catch (error) {
-          console.error("Error fetching users:", error?.message);
+          console.error("Error in /listusers:", error?.message);
           await lineClient.replyMessage(ev.replyToken, {
             type: "text",
             text: "ขอโทษค่ะ ไม่สามารถดึงรายชื่อผู้ใช้ได้ในขณะนี้"
           }).catch(() => {});
           continue;
         }
+      }
+
+      // Handle menu navigation
+      if (session && Date.now() - session.timestamp < 300000) { // 5 minute timeout
+        const input = text.trim();
+
+        // Main menu selection
+        if (session.step === 'main_menu') {
+          if (input === '1') {
+            // Show users that are NOT paused
+            const unpausedUsers = session.users.filter(user => !isHumanLive(user.userId));
+
+            if (unpausedUsers.length === 0) {
+              await lineClient.replyMessage(ev.replyToken, {
+                type: "text",
+                text: "ไม่มีผู้ใช้ที่สามารถ Pause ได้ (ทุกคนถูก Pause แล้ว)\n\nพิมพ์ /listusers เพื่อเริ่มใหม่"
+              });
+              menuSessions.delete(userId);
+              continue;
+            }
+
+            const pauseList = `เลือกผู้ใช้ที่ต้องการ Pause:\n\n${unpausedUsers.map((user, index) =>
+              `${index + 1}. ${user.displayName}`
+            ).join('\n')}\n\nพิมพ์หมายเลข 1-${unpausedUsers.length}`;
+
+            menuSessions.set(userId, {
+              step: 'pause_selection',
+              users: unpausedUsers,
+              timestamp: Date.now()
+            });
+
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: pauseList
+            });
+            continue;
+
+          } else if (input === '2') {
+            // Show users that ARE paused
+            const pausedUsers = session.users.filter(user => isHumanLive(user.userId));
+
+            if (pausedUsers.length === 0) {
+              await lineClient.replyMessage(ev.replyToken, {
+                type: "text",
+                text: "ไม่มีผู้ใช้ที่ถูก Pause อยู่\n\nพิมพ์ /listusers เพื่อเริ่มใหม่"
+              });
+              menuSessions.delete(userId);
+              continue;
+            }
+
+            const resumeList = `เลือกผู้ใช้ที่ต้องการ Resume:\n\n${pausedUsers.map((user, index) =>
+              `${index + 1}. ${user.displayName}`
+            ).join('\n')}\n\nพิมพ์หมายเลข 1-${pausedUsers.length}`;
+
+            menuSessions.set(userId, {
+              step: 'resume_selection',
+              users: pausedUsers,
+              timestamp: Date.now()
+            });
+
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: resumeList
+            });
+            continue;
+
+          } else {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: "กรุณาพิมพ์ 1 หรือ 2 เท่านั้น\n\nพิมพ์ /listusers เพื่อเริ่มใหม่"
+            });
+            continue;
+          }
+        }
+
+        // Pause user selection
+        else if (session.step === 'pause_selection') {
+          const selectedIndex = parseInt(input) - 1;
+
+          if (selectedIndex >= 0 && selectedIndex < session.users.length) {
+            const selectedUser = session.users[selectedIndex];
+            const until = setHumanLive(selectedUser.userId, HUMAN_SILENCE_MINUTES);
+
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: `✅ Pause สำเร็จ!\n\n${selectedUser.displayName} ถูก Pause แล้ว\nจนถึง: ${new Date(until).toLocaleString('th-TH')}\n\nพิมพ์ /listusers เพื่อจัดการผู้ใช้อื่น`
+            });
+
+            console.log("[MENU] Paused user:", selectedUser.userId, selectedUser.displayName);
+            menuSessions.delete(userId);
+            continue;
+          } else {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: `กรุณาพิมพ์หมายเลข 1-${session.users.length} เท่านั้น`
+            });
+            continue;
+          }
+        }
+
+        // Resume user selection
+        else if (session.step === 'resume_selection') {
+          const selectedIndex = parseInt(input) - 1;
+
+          if (selectedIndex >= 0 && selectedIndex < session.users.length) {
+            const selectedUser = session.users[selectedIndex];
+            clearHumanLive(selectedUser.userId);
+
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: `✅ Resume สำเร็จ!\n\n${selectedUser.displayName} สามารถใช้งาน AI ได้แล้ว\n\nพิมพ์ /listusers เพื่อจัดการผู้ใช้อื่น`
+            });
+
+            console.log("[MENU] Resumed user:", selectedUser.userId, selectedUser.displayName);
+            menuSessions.delete(userId);
+            continue;
+          } else {
+            await lineClient.replyMessage(ev.replyToken, {
+              type: "text",
+              text: `กรุณาพิมพ์หมายเลข 1-${session.users.length} เท่านั้น`
+            });
+            continue;
+          }
+        }
+      } else if (session) {
+        // Session expired
+        menuSessions.delete(userId);
       }
 
       // === NEW: human takeover guard ===
