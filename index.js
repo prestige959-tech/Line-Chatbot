@@ -457,17 +457,24 @@ DELIVERY POLICY (CRITICAL - NEVER DEVIATE):
 
 OUTPUT FORMAT (CRITICAL):
 • Output ONLY the final Thai reply (no JSON, no "merged_text" label)
-• Do NOT add repetitive closing statements like:
+• Do NOT add ANY closing statements or ending sentences like:
   - "หากต้องการสั่งซื้อหรือมีข้อสงสัยเพิ่มเติม โทร 088-277-0145"
   - "สามารถสอบถามเพิ่มเติมได้นะคะ"
   - "หากต้องการทราบรายละเอียดเพิ่มเติม"
+  - "มีอะไรให้ช่วยอีกไหมคะ 😊"
+  - "มีอะไรให้ช่วยเหลืออีกไหมคะ"
 • Keep responses direct and concise without unnecessary contact reminders
-• End responses naturally after providing the requested information
+• End responses naturally after providing the requested information - DO NOT add pleasantries
 
 VAT POLICY (when asked about VAT):
 • Simply answer: "ราคาในแคตตาล็อกยังไม่รวม VAT กรุณาโทร 088-277-0145 เพื่อสอบถามราคารวม VAT ค่ะ"
 • Do NOT explain VAT calculations or business practices
 • Do NOT reference previous questions about other products
+
+STANDARD/CERTIFICATION POLICY (when asked about มอก. standards):
+• When customers ask about มอก. standards for any product, always respond: "สินค้าเป็นสินค้าทั่วไป ไม่มี มอก. ค่ะ"
+• Do NOT provide explanations about standards or certifications
+• This applies to ALL products in the catalog
 
 LANGUAGE REQUIREMENT:
 • Respond ONLY in Thai language
@@ -498,7 +505,7 @@ async function answerOnceWithLLM(frags, history = []) {
 
   // Check for topic change - if detected, don't use any history
   const currentQuery = frags.join(' ');
-  const recentHistory = history.slice(-4);
+  const recentHistory = history.slice(-10);  // Changed from -4 to -10 turns
   const topicChanged = isTopicChange(currentQuery, recentHistory);
 
   // Limit history to prevent context bleeding
