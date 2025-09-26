@@ -253,26 +253,25 @@ function detectProductGroup(query) {
   return best;
 }
 
-// Detect if current question is about a completely different topic than recent conversation
+// Detect if current question is about a completely different domain (more conservative approach)
 function isTopicChange(currentQuery, recentHistory) {
   if (!recentHistory.length) return false;
 
-  // Check if current query is about delivery
+  // Only consider major topic changes that would benefit from context reset
   const currentIsDelivery = /ส่ง|จัดส่ง|delivery|ค่าส่ง|lalamove/i.test(currentQuery);
+  const currentIsLocation = /ที่อยู่|แผนที่|map|location|เปิด|ปิด|เวลา/i.test(currentQuery);
+  const currentIsPayment = /จ่าย|ชำระ|โอน|payment|บัตร|เงินสด/i.test(currentQuery);
 
-  // Check if recent history was about product/pricing
-  const recentWasProduct = recentHistory.some(msg =>
+  // Check recent conversation topics
+  const recentWasProduct = recentHistory.slice(-4).some(msg =>
     msg.role === 'user' && detectProductGroup(msg.content)
   );
 
-  // If switching from product discussion to delivery, or vice versa, it's a topic change
-  const currentProduct = detectProductGroup(currentQuery);
-  const wasDiscussingDelivery = recentHistory.some(msg =>
-    msg.role === 'user' && /ส่ง|จัดส่ง|delivery|ค่าส่ง|lalamove/i.test(msg.content)
-  );
+  // Only reset context for major domain switches that could cause confusion
+  // Allow all product-related conversations (pricing, specs, comparisons) to keep context
+  const majorTopicSwitch = (currentIsDelivery || currentIsLocation || currentIsPayment) && recentWasProduct;
 
-  return (currentIsDelivery && recentWasProduct) ||
-         (currentProduct && wasDiscussingDelivery);
+  return majorTopicSwitch;
 }
 const SPEC_RE   = /ขนาด|สเปค|สเป็ค|กว้าง|ยาว|หนา/i;
 const BUNDLE_RE = /(มัด).*กี่|กี่เส้น|กี่แผ่น|กี่ท่อน/i;
@@ -358,12 +357,12 @@ APPROACH: Think step by step before responding:
 7. Offer relevant suggestions when appropriate
 
 CONTEXT HANDLING (CRITICAL):
-• Answer ONLY the customer's current/latest question - COMPLETELY IGNORE previous questions unless directly related to current request
-• Do NOT mix up topics from earlier in the conversation (e.g., if customer asked about delivery earlier, don't mention delivery unless current question is about delivery)
-• NEVER bring up or reference previous conversation topics automatically
-• Focus EXCLUSIVELY on the immediate request only
+• Answer the customer's current question directly and precisely
+• Use conversation history when it helps understand the current question (product comparisons, follow-up questions, clarifications)
+• Do NOT mix up completely different topics (e.g., if customer asked about delivery earlier but now asks about product pricing, focus on pricing only)
+• Within the same domain (products, pricing, specifications), use previous context intelligently
+• For major topic switches (products → delivery → location → payment), focus primarily on the current question
 • If previous context is needed for clarity, ask for clarification instead of assuming
-• Each response should treat the current question as independent unless explicitly connected
 
 HANDLING MULTIPLE QUESTIONS:
 When customers ask multiple questions in their message fragments:
