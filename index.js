@@ -4,7 +4,7 @@
 import express from "express";
 import * as line from "@line/bot-sdk"; // correct: no default export
 import { readFile } from "fs/promises";
-import { getContext, setContext, getAllUserIds } from "./chatMemory.js";
+import { getContext, setContext, getAllUserIds, getUsersWithProfiles } from "./chatMemory.js";
 
 const app = express();
 
@@ -117,9 +117,9 @@ app.post("/admin/resume", express.json(), (req, res) => {
 app.get("/admin/listusers", async (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
   try {
-    const userIds = await getAllUserIds();
-    console.log("[ADMIN] listusers → found", userIds.length, "users");
-    res.json({ ok: true, users: userIds, count: userIds.length });
+    const users = await getUsersWithProfiles(lineClient);
+    console.log("[ADMIN] listusers → found", users.length, "users with profiles");
+    res.json({ ok: true, users, count: users.length });
   } catch (error) {
     console.error("[ADMIN] listusers error:", error?.message);
     res.status(500).json({ ok: false, error: "failed to fetch users" });
@@ -502,16 +502,18 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       // === Check for /listusers command ===
       if (text.toLowerCase() === '/listusers') {
         try {
-          const userIds = await getAllUserIds();
-          const userList = userIds.length > 0
-            ? `รายชื่อผู้ใช้ทั้งหมด (${userIds.length} คน):\n\n${userIds.map((id, index) => `${index + 1}. ${id}`).join('\n')}`
+          const users = await getUsersWithProfiles(lineClient);
+          const userList = users.length > 0
+            ? `รายชื่อผู้ใช้ทั้งหมด (${users.length} คน):\n\n${users.map((user, index) =>
+                `${index + 1}. ${user.displayName}\n   ID: ${user.userId}`
+              ).join('\n\n')}`
             : 'ยังไม่มีผู้ใช้ในระบบค่ะ';
 
           await lineClient.replyMessage(ev.replyToken, {
             type: "text",
             text: userList.slice(0, 5000)
           });
-          console.log("Sent user list:", userIds.length, "users");
+          console.log("Sent user list with profiles:", users.length, "users");
           continue;
         } catch (error) {
           console.error("Error fetching users:", error?.message);
