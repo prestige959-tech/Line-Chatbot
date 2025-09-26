@@ -433,12 +433,15 @@ async function answerOnceWithLLM(frags, history = []) {
       return content.trim();
     } catch (e) {
       const msg = String(e?.message || "");
-      // if 429/rate-limited upstream, try next model immediately
-      if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429")) {
+      // Try next model for common recoverable errors
+      if (msg.includes("OpenRouter 429") || msg.includes("rate-limited") || msg.includes("429") ||
+          msg.includes("aborted") || msg.includes("timeout") || msg.includes("network") ||
+          msg.includes("ECONNRESET") || msg.includes("ETIMEDOUT")) {
+        console.log(`Model ${model} failed (${msg}), trying next model...`);
         lastErr = e;
         continue;
       }
-      // otherwise, bubble up the error
+      // For non-recoverable errors, bubble up immediately
       throw e;
     }
   }
