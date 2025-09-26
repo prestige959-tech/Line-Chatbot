@@ -252,6 +252,28 @@ function detectProductGroup(query) {
   }
   return best;
 }
+
+// Detect if current question is about a completely different topic than recent conversation
+function isTopicChange(currentQuery, recentHistory) {
+  if (!recentHistory.length) return false;
+
+  // Check if current query is about delivery
+  const currentIsDelivery = /ส่ง|จัดส่ง|delivery|ค่าส่ง|lalamove/i.test(currentQuery);
+
+  // Check if recent history was about product/pricing
+  const recentWasProduct = recentHistory.some(msg =>
+    msg.role === 'user' && detectProductGroup(msg.content)
+  );
+
+  // If switching from product discussion to delivery, or vice versa, it's a topic change
+  const currentProduct = detectProductGroup(currentQuery);
+  const wasDiscussingDelivery = recentHistory.some(msg =>
+    msg.role === 'user' && /ส่ง|จัดส่ง|delivery|ค่าส่ง|lalamove/i.test(msg.content)
+  );
+
+  return (currentIsDelivery && recentWasProduct) ||
+         (currentProduct && wasDiscussingDelivery);
+}
 const SPEC_RE   = /ขนาด|สเปค|สเป็ค|กว้าง|ยาว|หนา/i;
 const BUNDLE_RE = /(มัด).*กี่|กี่เส้น|กี่แผ่น|กี่ท่อน/i;
 function looksLikeProductOnly(msg) {
@@ -336,10 +358,12 @@ APPROACH: Think step by step before responding:
 7. Offer relevant suggestions when appropriate
 
 CONTEXT HANDLING (CRITICAL):
-• Answer ONLY the customer's current/latest question - ignore previous questions unless directly related
-• Do NOT refer to or summarize previous conversation topics
-• Focus on the immediate request only
+• Answer ONLY the customer's current/latest question - COMPLETELY IGNORE previous questions unless directly related to current request
+• Do NOT mix up topics from earlier in the conversation (e.g., if customer asked about delivery earlier, don't mention delivery unless current question is about delivery)
+• NEVER bring up or reference previous conversation topics automatically
+• Focus EXCLUSIVELY on the immediate request only
 • If previous context is needed for clarity, ask for clarification instead of assuming
+• Each response should treat the current question as independent unless explicitly connected
 
 HANDLING MULTIPLE QUESTIONS:
 When customers ask multiple questions in their message fragments:
@@ -451,6 +475,15 @@ async function answerOnceWithLLM(frags, history = []) {
   const systemPrompt = buildSystemPrompt(productList);
   const user = frags.map((f, i) => `[${i+1}] ${f}`).join("\n");
 
+  // Check for topic change - if detected, don't use any history
+  const currentQuery = frags.join(' ');
+  const recentHistory = history.slice(-4);
+  const topicChanged = isTopicChange(currentQuery, recentHistory);
+
+  // Limit history to prevent context bleeding
+  // If topic changed completely, don't use any history to avoid mixing topics
+  const limitedHistory = topicChanged ? [] : recentHistory;
+
   let lastErr;
   for (const model of MODELS) {
     try {
@@ -459,7 +492,7 @@ async function answerOnceWithLLM(frags, history = []) {
         temperature: 0.7,
         messages: [
           { role: "system", content: systemPrompt },
-          ...history.slice(-20),   // keep last 20 turns
+          ...limitedHistory,   // keep only last 4 turns instead of 20
           { role: "user", content: user }
         ]
       }, { title: `my-shop-prices single-call (${model})`, referer: "https://github.com/prestige959-tech/my-shop-prices"});
