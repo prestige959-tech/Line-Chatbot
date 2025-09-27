@@ -435,7 +435,7 @@ async function answerOnceWithLLM(frags, history = []) {
     try {
       const data = await fetchOpenRouter({
         model,
-        temperature: 0.7,
+        temperature: 0.5,
         messages: [
           { role: "system", content: systemPrompt },
           ...limitedHistory,   // keep only last 4 turns instead of 20
