@@ -362,7 +362,7 @@ ${productList}
 
 CORE RULES:
 • Use ONLY catalog data - NEVER invent prices, specs, or bundles
-• Only mention phone 088-277-0145 when: missing catalog info, ordering details, complex questions
+• Only mention phone 088-277-0145 (no name) when: missing catalog info, ordering details, complex questions
 • Match products using name/aliases/tags/ขนาด - list best 1-3 matches if multiple fit
 • Ask max ONE clarifying question when needed
 
