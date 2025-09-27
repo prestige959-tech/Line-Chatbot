@@ -211,6 +211,14 @@ const buffers = new Map();
 function pushFragment(userId, text, onReady, silenceMs = SILENCE_MS, maxWindowMs = MAX_WINDOW_MS, maxFrags = MAX_FRAGS) {
   let buf = buffers.get(userId);
   const now = Date.now();
+
+  // If buffer exists but has been idle for too long, clear it to start fresh
+  if (buf && buf.firstAt && (now - buf.firstAt) > maxWindowMs * 2) {
+    console.log(`Clearing stale buffer for ${userId}`);
+    buffers.delete(userId);
+    buf = null;
+  }
+
   if (!buf) { buf = { frags: [], timer: null, firstAt: now }; buffers.set(userId, buf); }
 
   buf.frags.push(text);
@@ -755,6 +763,9 @@ app.post("/webhook", line.middleware(lineConfig), async (req, res) => {
       const history = await getContext(userId);
 
       pushFragment(userId, text, async (frags) => {
+        // Debug logging for fragment issues
+        console.log(`Processing fragments for ${userId}:`, frags.map((f, i) => `[${i+1}] ${f}`));
+
         // ---------- Clear pendingIntent completely to prevent mixing topics ----------
         // This prevents previous specification or bundle questions from affecting current questions
         pendingIntent.delete(userId);
